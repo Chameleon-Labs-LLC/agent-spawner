@@ -1,0 +1,12 @@
+<toolSet name="External Tools">
+  <tool name="Run {{name}} Locally" showInMainMenu="true" showInEditor="false"
+        showInProject="true" showInSearchPopup="true" disabled="false"
+        useConsole="true" showConsoleOnStdOut="true" showConsoleOnStdErr="true"
+        synchronizeAfterRun="true">
+    <exec>
+      <option name="COMMAND" value="$ProjectFileDir$/.venv/{{venv_bin}}/python" />
+      <option name="PARAMETERS" value="$ProjectFileDir$/agents/{{name}}/local/agent.py" />
+      <option name="WORKING_DIRECTORY" value="$ProjectFileDir$/agents/{{name}}" />
+    </exec>
+  </tool>
+</toolSet>

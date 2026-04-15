@@ -1,0 +1,9 @@
+{
+  "_comment": "POST this body to https://api.anthropic.com/v1/managed-agents with header anthropic-beta: managed-agents-2026-04-01. Returns an agent ID; persist it in .env as MANAGED_AGENT_ID.",
+  "name": "{{name}}",
+  "description": "{{product}} {{type}} agent — {{system_prompt_short}}",
+  "model": "claude-sonnet-4-6",
+  "system_prompt": "{{system_prompt}}",
+  "mcp_servers": {{mcp_servers_json}},
+  "max_tokens": 4096
+}

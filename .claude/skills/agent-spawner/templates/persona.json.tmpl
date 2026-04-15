@@ -1,0 +1,23 @@
+{
+  "name": "{{name}}",
+  "product": "{{product}}",
+  "type": "{{type}}",
+  "system_prompt": "{{system_prompt}}",
+  "voice": {
+    "cartesia_voice_id": "",
+    "gemini_voice": "Kore"
+  },
+  "tools": [
+    "delegate_to_agent",
+    "answer_as_agent",
+    "get_time",
+    "list_agents"
+  ],
+  "mcp_servers": {{mcp_servers_json}},
+  "channels": {{channels_json}},
+  "hive_mind": {
+    "enabled": true,
+    "report_to": "~/.agents/hive.db"
+  },
+  "delegate": {{delegate_json}}
+}

@@ -1,0 +1,85 @@
+"""Discord adapter for {{name}} — discord.py."""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Awaitable, Callable
+
+import discord
+
+from .exfil import scrub
+from .audit import log_event
+
+log = logging.getLogger("{{name}}.discord")
+
+TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+ALLOWED = {int(x) for x in os.environ["DISCORD_ALLOWED_USER_IDS"].split(",") if x.strip()}
+PIN = os.environ["AGENT_PIN"]
+KILL = os.environ.get("AGENT_KILL_PHRASE", "emergency stop").lower().strip()
+IDLE_LOCK_SEC = 30 * 60
+
+_unlocked: dict[int, float] = {}
+
+
+def _is_unlocked(uid: int) -> bool:
+    last = _unlocked.get(uid)
+    if not last or time.time() - last > IDLE_LOCK_SEC:
+        _unlocked.pop(uid, None)
+        return False
+    _unlocked[uid] = time.time()
+    return True
+
+
+def run(handler: Callable[[str, str, str], Awaitable[str]]):
+    intents = discord.Intents.default()
+    intents.message_content = True  # must be enabled in dev portal too
+    client = discord.Client(intents=intents)
+
+    @client.event
+    async def on_ready():
+        log.info("discord adapter ready as %s, allowlist=%s", client.user, ALLOWED)
+
+    @client.event
+    async def on_message(msg: discord.Message):
+        if msg.author == client.user:
+            return
+        text = (msg.content or "").strip()
+        uid = msg.author.id
+
+        if text.lower() == KILL:
+            _unlocked.clear()
+            log_event("{{name}}", "in", "discord", str(uid), len(text), redacted=False, note="KILLED")
+            await msg.channel.send("Killed. All sessions locked.")
+            return
+
+        if uid not in ALLOWED:
+            log.warning("dropped message from non-allowlisted user %s", uid)
+            return
+
+        if text.startswith("/unlock "):
+            pin = text.split(" ", 1)[1].strip()
+            if pin == PIN:
+                _unlocked[uid] = time.time()
+                await msg.channel.send("Unlocked. Idle lock in 30 min.")
+            else:
+                await msg.channel.send("Wrong PIN.")
+            return
+
+        if not _is_unlocked(uid):
+            await msg.channel.send("Locked. Send /unlock <PIN>.")
+            return
+
+        log_event("{{name}}", "in", "discord", str(uid), len(text), redacted=False)
+        try:
+            reply = await handler(text, "discord", str(uid))
+        except Exception as e:
+            log.exception("handler crashed")
+            await msg.channel.send(f"Error: {e}")
+            return
+
+        scrubbed, was_redacted = scrub(reply, return_flag=True)
+        log_event("{{name}}", "out", "discord", str(uid), len(scrubbed), redacted=was_redacted)
+        await msg.channel.send(scrubbed)
+
+    return client.start(TOKEN)

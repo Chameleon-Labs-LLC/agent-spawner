@@ -1,0 +1,134 @@
+# {{name}}
+
+**Namespace:** {{product}} · **Type:** {{type}} · **Channels:** {{channels_human}}
+
+{{system_prompt}}
+
+---
+
+## Setup (one time)
+
+### 1. Fill in `.env`
+
+```bash
+cp .env.example .env
+```
+
+Required keys for **{{type}}** agents:
+
+{{required_env_keys_md}}
+
+### 2. Install deps
+
+From this agent folder (Linux primary):
+
+```bash
+uv sync
+```
+
+If you don't have `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
+
+{{managed_setup_block}}
+
+### 3. Hook up the channels
+
+{{channel_setup_md}}
+
+### 4. (Optional) Autostart
+
+| OS | What to do |
+|---|---|
+| **Linux** (primary) | `mkdir -p ~/.config/systemd/user && cp autostart/systemd-user.service ~/.config/systemd/user/{{product}}-{{name}}.service && systemctl --user daemon-reload && systemctl --user enable --now {{product}}-{{name}}` |
+| Windows | Edit `autostart/windows-task.xml` to point at your repo paths, then: `schtasks /Create /XML autostart\windows-task.xml /TN "{{product}}\{{name}}"` (elevated prompt, first time). |
+
+### 5. IDE integration
+
+> **There is no JetBrains plugin yet** for Claude Code or Agent SDK. The configs below give you a one-click "▶ Run" experience using built-in JetBrains/VSCode features.
+
+**JetBrains** (PyCharm, IntelliJ, WebStorm):
+1. Copy `ide/jetbrains-external-tool.xml` to `<repo-root>/.idea/tools/External Tools.xml` (merge if it exists)
+2. Copy `ide/jetbrains-run-config.xml` to `<repo-root>/.idea/runConfigurations/Run_{{name}}_Locally.xml`
+3. Restart the IDE — *Run {{name}} Locally* appears in both the Tools menu and the run-configuration dropdown
+
+**VSCode / Cursor:**
+- Merge the contents of `ide/vscode-tasks.json` into `<repo-root>/.vscode/tasks.json`
+- Run via *Terminal → Run Task → Run {{name}} locally*
+
+---
+
+## Run manually
+
+```bash
+python local/agent.py
+```
+
+In another terminal, message the bot via your channel and start with `/unlock <PIN>` (the PIN is in your `.env`).
+
+---
+
+## Deploy to a remote Linux host
+
+From the skill folder:
+
+```bash
+scripts/deploy.sh <ip-or-host> <path-to-this-folder> --setup --enable-systemd
+```
+
+The script discovers an SSH key, tests connectivity, copies the zip, and (optionally) sets up the venv + systemd unit on the remote. It **does not** transport `.env` — you must populate secrets on the remote host manually. See `references/deploy.md` in the skill.
+
+---
+
+## Architecture
+
+This agent implements the 8-stage message pipeline:
+
+```
+channel → queue → classifier → memory → SDK → exfil guard → cost footer → reply
+```
+
+…with the four-ring security model: allowlist → PIN → exfil guard → audit log, plus a kill-phrase short-circuit that bypasses the allowlist.
+
+{{bridge_block}}
+
+## Files
+
+```
+{{name}}/
+├── persona.json                    # the spec card — name, prompt, tools, voice
+├── pyproject.toml                  # uv-managed deps
+├── .env.example                    # template; copy to .env
+├── managed/
+│   └── definition.json             # POST body for Managed Agents API
+├── local/
+│   ├── agent.py                    # 8-stage pipeline runtime
+│   └── bridge.py                   # HMAC-signed call into managed peer (hybrid only)
+├── channels/
+│   ├── exfil.py                    # ring 3
+│   ├── audit.py                    # ring 4
+{{channel_files_md}}
+├── ide/
+│   ├── jetbrains-external-tool.xml
+│   ├── jetbrains-run-config.xml
+│   └── vscode-tasks.json
+├── autostart/
+│   ├── systemd-user.service        # Linux (primary)
+│   └── windows-task.xml            # Windows (secondary)
+└── README.md (this file)
+```
+
+## Operations
+
+- **Hive mind:** task records land in `~/.agents/hive.db`. Query with any SQLite client.
+- **Audit log:** `~/.agents/audit/{{name}}.jsonl`, one JSON object per line.
+- **Kill phrase:** send `emergency stop` (or whatever you set `AGENT_KILL_PHRASE` to). Locks all sessions immediately.
+
+## When things go wrong
+
+| Symptom | Likely cause |
+|---|---|
+| Bot ignores your messages | Your chat/user ID isn't in the allowlist env var. Check rings 1 & 2 logs. |
+| "Wrong PIN" no matter what | `AGENT_PIN` in `.env` doesn't match what you typed. PINs are exact-string. |
+| `[REDACTED — exfil guard]` in legitimate output | A pattern in `EXFIL_DENY_PATTERNS` is too broad. Tune it. |
+| Hybrid call gets 401 from managed peer | `BRIDGE_HMAC_SECRET` doesn't match between local and managed sides. |
+| Managed registration 400s on MCP | One of your MCP URLs isn't HTTPS-reachable, or it's a STDIO server. |
+| Deploy fails: `Permission denied (publickey)` | Remote host doesn't have your pubkey. Run `ssh-copy-id <user>@<host>` first. |

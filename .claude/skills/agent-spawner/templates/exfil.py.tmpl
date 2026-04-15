@@ -1,0 +1,36 @@
+"""Exfil guard for {{name}} — ring 3 of the security model."""
+from __future__ import annotations
+
+import os
+import re
+
+DEFAULT_PATTERNS = [
+    r"sk-ant-[a-zA-Z0-9_\-]{32,}",
+    r"xoxb-[a-zA-Z0-9-]{10,}",
+    r"xapp-[a-zA-Z0-9-]{10,}",
+    r"\b\d{8,10}:[a-zA-Z0-9_\-]{35}\b",
+]
+
+# Add the bridge HMAC secret if present so we never echo it
+_secret = os.environ.get("BRIDGE_HMAC_SECRET")
+if _secret:
+    DEFAULT_PATTERNS.append(re.escape(_secret))
+
+_custom = os.environ.get("EXFIL_DENY_PATTERNS", "")
+if _custom:
+    DEFAULT_PATTERNS.extend([p.strip() for p in _custom.split(",") if p.strip()])
+
+_compiled = [re.compile(p) for p in DEFAULT_PATTERNS]
+REPLACEMENT = "[REDACTED — exfil guard]"
+
+
+def scrub(text: str, return_flag: bool = False):
+    redacted = False
+    out = text
+    for rx in _compiled:
+        if rx.search(out):
+            redacted = True
+            out = rx.sub(REPLACEMENT, out)
+    if return_flag:
+        return out, redacted
+    return out

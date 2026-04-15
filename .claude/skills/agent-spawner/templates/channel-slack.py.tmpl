@@ -1,0 +1,81 @@
+"""Slack adapter for {{name}} — Socket Mode (no public URL needed)."""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Awaitable, Callable
+
+from slack_bolt.async_app import AsyncApp
+from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+
+from .exfil import scrub
+from .audit import log_event
+
+log = logging.getLogger("{{name}}.slack")
+
+BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]      # xoxb-...
+APP_TOKEN = os.environ["SLACK_APP_TOKEN"]      # xapp-...
+ALLOWED = {x.strip() for x in os.environ["SLACK_ALLOWED_USER_IDS"].split(",") if x.strip()}
+PIN = os.environ["AGENT_PIN"]
+KILL = os.environ.get("AGENT_KILL_PHRASE", "emergency stop").lower().strip()
+IDLE_LOCK_SEC = 30 * 60
+
+_unlocked: dict[str, float] = {}
+
+
+def _is_unlocked(uid: str) -> bool:
+    last = _unlocked.get(uid)
+    if not last or time.time() - last > IDLE_LOCK_SEC:
+        _unlocked.pop(uid, None)
+        return False
+    _unlocked[uid] = time.time()
+    return True
+
+
+def run(handler: Callable[[str, str, str], Awaitable[str]]):
+    app = AsyncApp(token=BOT_TOKEN)
+
+    @app.event("message")
+    async def on_message(event, say):
+        uid = event.get("user")
+        text = (event.get("text") or "").strip()
+
+        if text.lower() == KILL:
+            _unlocked.clear()
+            log_event("{{name}}", "in", "slack", uid or "?", len(text), redacted=False, note="KILLED")
+            await say("Killed. All sessions locked.")
+            return
+
+        if uid not in ALLOWED:
+            log.warning("dropped message from non-allowlisted user %s", uid)
+            return
+
+        if text.startswith("/unlock "):
+            pin = text.split(" ", 1)[1].strip()
+            if pin == PIN:
+                _unlocked[uid] = time.time()
+                await say("Unlocked. Idle lock in 30 min.")
+            else:
+                await say("Wrong PIN.")
+            return
+
+        if not _is_unlocked(uid):
+            await say("Locked. Send /unlock <PIN>.")
+            return
+
+        log_event("{{name}}", "in", "slack", uid, len(text), redacted=False)
+        try:
+            reply = await handler(text, "slack", uid)
+        except Exception as e:
+            log.exception("handler crashed")
+            await say(f"Error: {e}")
+            return
+
+        scrubbed, was_redacted = scrub(reply, return_flag=True)
+        log_event("{{name}}", "out", "slack", uid, len(scrubbed), redacted=was_redacted)
+        await say(scrubbed)
+
+    handler_obj = AsyncSocketModeHandler(app, APP_TOKEN)
+    log.info("slack adapter ready, allowlist=%s", ALLOWED)
+    return handler_obj.start_async()

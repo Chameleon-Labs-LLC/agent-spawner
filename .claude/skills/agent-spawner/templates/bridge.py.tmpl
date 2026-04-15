@@ -1,0 +1,73 @@
+"""
+Verified bridge: local agent → managed agent.
+
+Generates HMAC-signed requests against the managed agent's session API.
+Replay-protected via timestamp + nonce.
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import time
+from typing import Any
+
+import httpx
+
+DELEGATE_TO = "{{delegate_to}}"
+DELEGATE_URL = "{{delegate_url}}"  # e.g. https://api.anthropic.com/v1/managed-agents/<id>
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+BRIDGE_HMAC_SECRET = os.environ["BRIDGE_HMAC_SECRET"].encode()
+
+
+def _sign(body: bytes) -> dict[str, str]:
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    body_hash = hashlib.sha256(body).hexdigest()
+    msg = f"{ts}.{nonce}.{body_hash}".encode()
+    sig = hmac.new(BRIDGE_HMAC_SECRET, msg, hashlib.sha256).hexdigest()
+    return {
+        "X-Bridge-Timestamp": ts,
+        "X-Bridge-Nonce": nonce,
+        "X-Bridge-Signature": sig,
+    }
+
+
+async def delegate(task: str, session_id: str | None = None) -> dict[str, Any]:
+    """
+    Send a task to the managed agent. Returns the streamed result as a dict.
+    If session_id is None, opens a new session first.
+    """
+    headers = {
+        "Authorization": f"Bearer {ANTHROPIC_API_KEY}",
+        "anthropic-beta": "managed-agents-2026-04-01",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        if session_id is None:
+            r = await client.post(f"{DELEGATE_URL}/sessions", headers=headers, json={})
+            r.raise_for_status()
+            session_id = r.json()["id"]
+
+        body = json.dumps({"type": "user_message", "content": task}).encode()
+        headers.update(_sign(body))
+
+        r = await client.post(
+            f"{DELEGATE_URL}/sessions/{session_id}/events",
+            headers=headers,
+            content=body,
+        )
+        r.raise_for_status()
+
+        # Stream SSE
+        result = {"session_id": session_id, "events": []}
+        async with client.stream(
+            "GET", f"{DELEGATE_URL}/sessions/{session_id}/stream", headers=headers
+        ) as stream:
+            async for line in stream.aiter_lines():
+                if line.startswith("data: "):
+                    result["events"].append(json.loads(line[6:]))
+        return result

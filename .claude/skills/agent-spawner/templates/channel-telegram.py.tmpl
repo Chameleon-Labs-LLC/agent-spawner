@@ -1,0 +1,96 @@
+"""
+Telegram adapter for {{name}}.
+
+Implements rings 1-4: allowlist → PIN → exfil guard → audit log.
+Plus the kill-phrase short-circuit.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Awaitable, Callable
+
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+
+from .exfil import scrub
+from .audit import log_event
+
+log = logging.getLogger("{{name}}.telegram")
+
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+ALLOWED = {int(x) for x in os.environ["TELEGRAM_ALLOWED_CHAT_IDS"].split(",") if x.strip()}
+PIN = os.environ["AGENT_PIN"]
+KILL = os.environ.get("AGENT_KILL_PHRASE", "emergency stop").lower().strip()
+IDLE_LOCK_SEC = 30 * 60
+
+_unlocked: dict[int, float] = {}  # chat_id -> last_activity_ts
+
+
+def _is_unlocked(chat_id: int) -> bool:
+    last = _unlocked.get(chat_id)
+    if not last:
+        return False
+    if time.time() - last > IDLE_LOCK_SEC:
+        _unlocked.pop(chat_id, None)
+        return False
+    _unlocked[chat_id] = time.time()
+    return True
+
+
+def run(handler: Callable[[str, str, str], Awaitable[str]]):
+    """Entry point called by local/agent.py. `handler(text, channel, user_id) -> reply`."""
+
+    async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        chat_id = update.effective_chat.id
+        text = (msg.text or "").strip()
+
+        # Kill phrase — checked BEFORE allowlist (defense in depth)
+        if text.lower() == KILL:
+            _unlocked.clear()
+            log_event("{{name}}", "in", "telegram", str(chat_id), len(text), redacted=False, note="KILLED")
+            await msg.reply_text("Killed. All sessions locked.")
+            return
+
+        # Ring 1: allowlist
+        if chat_id not in ALLOWED:
+            log.warning("dropped message from non-allowlisted chat %s", chat_id)
+            return  # silent drop — don't ack
+
+        # Ring 2: PIN
+        if text.startswith("/unlock "):
+            pin = text.split(" ", 1)[1].strip()
+            if pin == PIN:
+                _unlocked[chat_id] = time.time()
+                await msg.reply_text("Unlocked. Idle lock in 30 min.")
+            else:
+                await msg.reply_text("Wrong PIN.")
+            return
+
+        if not _is_unlocked(chat_id):
+            await msg.reply_text("Locked. Send /unlock <PIN>.")
+            return
+
+        log_event("{{name}}", "in", "telegram", str(chat_id), len(text), redacted=False)
+
+        # Pipeline
+        try:
+            reply = await handler(text, "telegram", str(chat_id))
+        except Exception as e:
+            log.exception("handler crashed")
+            await msg.reply_text(f"Error: {e}")
+            return
+
+        # Ring 3: exfil guard (handler may have already scrubbed; double-scrub is cheap)
+        scrubbed, was_redacted = scrub(reply, return_flag=True)
+        log_event("{{name}}", "out", "telegram", str(chat_id), len(scrubbed), redacted=was_redacted)
+        await msg.reply_text(scrubbed)
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND | filters.COMMAND, on_message))
+    log.info("telegram adapter ready, allowlist=%s", ALLOWED)
+    return app.run_polling(close_loop=False)

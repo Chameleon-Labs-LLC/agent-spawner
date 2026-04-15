@@ -1,0 +1,30 @@
+"""Audit log for {{name}} — ring 4."""
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+AUDIT_DIR = Path(os.getenv("AUDIT_DIR", str(Path.home() / ".agents" / "audit")))
+AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+LOG_CONTENT = os.getenv("AUDIT_LOG_CONTENT", "0") == "1"
+
+
+def log_event(agent: str, direction: str, channel: str, user: str, length: int,
+              redacted: bool, note: str = "", content: str | None = None):
+    rec = {
+        "ts": time.time(),
+        "agent": agent,
+        "direction": direction,
+        "channel": channel,
+        "user": user,
+        "len": length,
+        "redacted": redacted,
+    }
+    if note:
+        rec["note"] = note
+    if LOG_CONTENT and content is not None:
+        rec["content"] = content
+    with (AUDIT_DIR / f"{agent}.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")

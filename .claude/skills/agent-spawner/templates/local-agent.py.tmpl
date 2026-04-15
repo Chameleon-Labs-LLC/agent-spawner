@@ -1,0 +1,111 @@
+"""
+{{name}} — local Agent SDK runtime.
+
+Implements the 8-stage pipeline from the ClaudeClaw v2 architecture:
+  channel → queue → classifier → memory → SDK → exfil guard → cost footer → reply
+
+Run: python local/agent.py
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import sqlite3
+import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Agent SDK — Python. If you prefer the JS SDK, swap this module for a Node bridge.
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+AGENT_NAME = "{{name}}"
+AGENT_TYPE = "{{type}}"
+HIVE_DB = Path(os.getenv("HIVE_DB", str(Path.home() / ".chameleon" / "hive.db")))
+HIVE_DB.parent.mkdir(parents=True, exist_ok=True)
+
+PERSONA = json.loads((Path(__file__).parent.parent / "persona.json").read_text())
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(AGENT_NAME)
+
+
+def _hive_record(task_id: str, summary: str, cost_usd: float, tin: int, tout: int, started: float):
+    conn = sqlite3.connect(HIVE_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS hive (
+            agent_id TEXT, task_id TEXT, started_at REAL, completed_at REAL,
+            summary TEXT, cost_usd REAL, tokens_in INTEGER, tokens_out INTEGER
+        )
+    """)
+    conn.execute(
+        "INSERT INTO hive VALUES (?,?,?,?,?,?,?,?)",
+        (AGENT_NAME, task_id, started, time.time(), summary, cost_usd, tin, tout),
+    )
+    conn.commit()
+    conn.close()
+
+
+async def handle_message(text: str, channel: str, user_id: str) -> str:
+    """Run one message through the 8-stage pipeline."""
+    started = time.time()
+    task_id = f"{int(started*1000)}"
+
+    # Stage 4: memory inject (loads any product-relevant CLAUDE.md)
+    system = PERSONA["system_prompt"]
+    claude_md = Path(__file__).parent.parent / "CLAUDE.md"
+    if claude_md.exists():
+        system = system + "\n\n" + claude_md.read_text()
+
+    # Stage 5: SDK
+    options = ClaudeAgentOptions(system_prompt=system, max_turns=10)
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(text)
+        chunks = []
+        async for msg in client.receive_response():
+            if hasattr(msg, "content"):
+                for block in msg.content:
+                    if hasattr(block, "text"):
+                        chunks.append(block.text)
+        reply = "".join(chunks)
+
+    # Stage 6: exfil guard
+    from channels.exfil import scrub
+    reply = scrub(reply)
+
+    # Stage 7: cost footer (rough — replace with actual usage from SDK when wired)
+    # Stage 8: reply (handled by channel adapter)
+
+    _hive_record(task_id, text[:200], 0.0, 0, 0, started)
+    return reply
+
+
+async def main():
+    log.info("starting %s (type=%s)", AGENT_NAME, AGENT_TYPE)
+
+    # Spawn channel adapters in parallel
+    tasks = []
+    for ch in PERSONA["channels"]:
+        if ch == "telegram":
+            from channels.telegram import run as run_tg
+            tasks.append(asyncio.create_task(run_tg(handle_message)))
+        elif ch == "slack":
+            from channels.slack import run as run_slack
+            tasks.append(asyncio.create_task(run_slack(handle_message)))
+        elif ch == "discord":
+            from channels.discord_bot import run as run_dc
+            tasks.append(asyncio.create_task(run_dc(handle_message)))
+
+    if not tasks:
+        log.info("no channels configured — agent is callable but idle. exiting.")
+        return
+
+    await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

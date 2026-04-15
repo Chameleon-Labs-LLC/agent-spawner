@@ -1,0 +1,20 @@
+[Unit]
+Description=Agent: {{name}} ({{product}}, {{type}})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust WorkingDirectory / ExecStart to match where you unpacked the agent.
+# Default assumes: ~/agents/{{name}}  with a venv at ~/agents/{{name}}/.venv
+WorkingDirectory=%h/agents/{{name}}
+EnvironmentFile=%h/agents/{{name}}/.env
+ExecStart=%h/agents/{{name}}/.venv/bin/python local/agent.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{product}}-{{name}}
+
+[Install]
+WantedBy=default.target
