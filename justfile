@@ -5,7 +5,7 @@
 set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-SKILL_DIR := justfile_directory() / ".claude-plugin/skills/agent-spawner"
+SKILL_DIR := justfile_directory() / "skills/agent-spawner"
 SCRIPTS   := SKILL_DIR / "scripts"
 
 # Default recipe: list everything.
