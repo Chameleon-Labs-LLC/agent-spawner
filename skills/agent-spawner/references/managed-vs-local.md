@@ -1,57 +1,79 @@
-# Managed vs Local — and the verified bridge between them
+# Managed vs Local — and the four agent shapes
 
-## When to pick which
+This skill scaffolds four agent shapes. Pick the one whose communication topology matches the job, not the one that sounds smartest.
 
-| Use case | Pick |
-|---|---|
-| Customer-facing surface, always-on backend | **managed** |
-| Webhook handler that needs to scale horizontally | **managed** |
-| Dev tool that runs on your laptop or a single VPS | **local** |
-| Workflow touching private data you don't want in someone else's cloud | **local** |
-| Local automation that occasionally needs a managed agent's full toolset | **hybrid** |
-| Local agent orchestrating several managed agents | **hybrid** |
+## The four shapes
 
-## Managed Agents constraints (current beta — subject to change)
+| `--type` | What runs where | Pick when |
+|---|---|---|
+| `local` | Pure Agent SDK process on your machine | Dev tools, single-VPS automation, work touching private data you don't want in Anthropic's cloud |
+| `managed` | Just the agent definition — you write the client elsewhere | You already have an orchestrator (Lambda, web server, ECS task) and just need the agent config + setup commands |
+| `orchestrator` | Managed agent + your client process holding the SSE stream + remote workers it dispatches custom-tool calls to | Production SaaS: managed-agent reasoning + your tools running on your hosts under your credentials |
+| `hybrid` | Local Agent SDK process that occasionally delegates to a managed peer | You're working locally and want to escalate certain tasks to a more capable managed agent. **Note the bridge gotcha below.** |
 
-- Required header: `anthropic-beta: managed-agents-2026-04-01`
-- REST flow: `create agent` → `start session` → `send events` → `stream SSE`
-- MCP servers are configured at **agent-definition time** (not per-session)
-- MCP servers must be **publicly HTTP-accessible** — STDIO transport is not supported
-- Only **tool calls** from the MCP spec are wired up — resources are not
-- Docs: https://platform.claude.com/docs/en/managed-agents/overview
+## The Managed Agents API in one paragraph
 
-If the user wants a managed agent with an MCP server that's STDIO-only:
-1. Wrap the STDIO server in an HTTP proxy (e.g., via Cloudflare Tunnel, `socat`, or a FastAPI shim)
-2. Make the agent local instead — local agents can use STDIO MCPs freely via the Agent SDK
-3. Make it hybrid — local agent uses STDIO MCPs locally, delegates HTTP-MCP-friendly tasks to a managed twin
+There are three core entities: **Agents** (`/v1/agents` — config: `model`, `system`, `tools`, `mcp_servers`, `skills`), **Environments** (`/v1/environments` — `config.type: "cloud"`, declares the per-session container shape), and **Sessions** (`/v1/sessions` — references an agent ID + an environment ID, gets its own container, streams events). To send a message: `POST /v1/sessions/{id}/events` with a `user.message` event. To receive: `GET /v1/sessions/{id}/events/stream` (SSE). Agents are versioned; update them with `POST /v1/agents/{id}` — every update bumps the version, existing sessions stay pinned. All managed endpoints need `anthropic-beta: managed-agents-2026-04-01` (the SDK adds it automatically for `client.beta.*` calls). The standard `x-api-key` and `anthropic-version: 2023-06-01` headers are also required for raw HTTP.
 
-## The verified bridge (local → managed)
+## Custom tools run on YOUR side, not in the container
 
-For hybrid agents, the local agent calls its managed twin's session API. To prevent anyone who learns the URL from invoking the agent, requests are HMAC-signed with a shared secret.
+This is the part the old version of this doc got wrong. When the agent decides to invoke a custom tool you've defined on the agent, **the call doesn't leave Anthropic's network as outbound HTTP.** Instead:
+
+1. The agent emits an `agent.custom_tool_use` event on the session's SSE stream.
+2. The session goes idle waiting.
+3. Your code (the orchestrator) — which holds that stream — receives the event, performs the work, and `POST`s a `user.custom_tool_result` event back to the session.
+4. The agent resumes.
+
+Two consequences:
+
+- **The orchestrator is a client** of the Anthropic API. It can be a Lambda, an ECS task, a long-running CLI — anything that can hold an HTTPS connection with your Anthropic API key. It's not an inbound HTTP server reachable from Anthropic.
+- **Your tools never receive a request from Anthropic.** Anything that needs to call out to your infrastructure goes orchestrator → your-infra, signed by your own scheme (HMAC, mTLS, whatever). Anthropic doesn't know or care.
+
+The built-in `agent_toolset_20260401` (bash, read, write, edit, glob, grep, web_fetch, web_search) runs *inside* the Anthropic-hosted container and is the only category of tools that executes on Anthropic's side.
+
+## The HMAC bridge — what it's actually for
+
+The scaffolder generates a `BRIDGE_HMAC_SECRET` and a signing primitive in `local/bridge.py`. It secures one specific leg: **orchestrator → worker** (or, in hybrid mode, **local agent → your verifier proxy → managed peer**).
 
 ### Protocol
 
-Local agent constructs an HTTPS POST to `<managed-agent-base-url>/sessions/<session-id>/events` with:
+```
+POST <your-worker-or-verifier>/<path>
+X-Bridge-Timestamp: <unix-seconds>
+X-Bridge-Nonce:     <16-byte hex>
+X-Bridge-Signature: hmac_sha256(BRIDGE_HMAC_SECRET, "<ts>.<nonce>.<sha256(body)>")
+Content-Type:       application/json
 
-- Header `X-Bridge-Timestamp: <unix-seconds>`
-- Header `X-Bridge-Nonce: <random 16 bytes hex>`
-- Header `X-Bridge-Signature: hmac-sha256(BRIDGE_HMAC_SECRET, "<timestamp>.<nonce>.<sha256-of-body>")`
-- Header `anthropic-beta: managed-agents-2026-04-01`
-- Header `Authorization: Bearer <ANTHROPIC_API_KEY>`
+<body>
+```
 
-Managed-side verification (runs as a thin proxy in front of the Managed Agents endpoint, or as a tool the managed agent calls before acting):
+Verification (on the worker / your verifier):
 
-1. Reject if `|now - timestamp|` > 60 seconds (replay protection)
+1. Reject if `|now - timestamp| > 60s`
 2. Reject if nonce has been seen in the last 5 minutes (in-memory LRU)
-3. Recompute the HMAC; constant-time compare
-4. If valid, forward to Managed Agents
+3. Recompute HMAC; constant-time compare via `hmac.compare_digest`
+4. If valid, dispatch the request
 
 ### Where the secret lives
 
-`BRIDGE_HMAC_SECRET` — generated by the scaffolder, written to `.env` on the local side, and **also** must be set wherever the managed-side verifier runs. The generated README makes this explicit and warns against committing `.env`.
+`BRIDGE_HMAC_SECRET` is generated by the scaffolder (32 bytes, `secrets.token_hex(32)`) and written to `.env` (gitignored). For production, lift it into a secrets manager (AWS SSM SecureString, HashiCorp Vault) and read it at startup on both sides. The signing primitive reads the secret from the environment — populate it however you like.
 
-The scaffolder generates a 32-byte secret with `secrets.token_hex(32)`.
+### Hybrid gotcha — Anthropic does NOT verify your HMAC
 
-### Why not just an API key?
+If you point `bridge.py`'s `DELEGATE_URL` at `https://api.anthropic.com/...` directly, the HMAC headers are silently dropped (Anthropic doesn't share your secret). The call is then authenticated by your bearer API key only, which is the same protection a hybrid setup would have without any HMAC. The headers only add real protection when something *you control* validates them — that's why a hybrid in production should target a verifier proxy (Lambda Function URL, API Gateway endpoint) that owns the secret and then forwards to Anthropic with the API key.
 
-Two reasons: (1) the Anthropic API key authenticates *any* call to the API — narrower auth is better; (2) HMAC + nonce + timestamp gives replay protection that bare bearer tokens don't.
+If you find yourself building that verifier proxy, you've reinvented the orchestrator pattern — pick `--type orchestrator` instead. See [orchestrator-pattern.md](orchestrator-pattern.md).
+
+## Managed Agents constraints worth remembering
+
+- Required beta header: `anthropic-beta: managed-agents-2026-04-01` (SDK auto-adds for `client.beta.*` calls)
+- Required flow: `agents.create` (ONCE — store the ID) → `environments.create` (once per workspace is fine) → `sessions.create` (every run, references both IDs)
+- MCP servers are configured at agent-definition time, must be publicly HTTPS-accessible (no STDIO), and OAuth credentials live in **Vaults** attached per-session
+- Custom tools are declared on the agent (`{"type": "custom", ...}`) and resolved by your orchestrator client (see above)
+- Agents are versioned. Update via `POST /v1/agents/{id}`; existing sessions keep their pinned version
+
+## Where to go next
+
+- For the orchestrator pattern in detail: [orchestrator-pattern.md](orchestrator-pattern.md)
+- For wiring web-user identity into a session safely: [auth-and-identity.md](auth-and-identity.md)
+- For the layered agent architecture (channels, security rings, pipeline stages): [architecture.md](architecture.md)
