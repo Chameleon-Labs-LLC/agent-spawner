@@ -1,9 +1,11 @@
 {
-  "_comment": "POST this body to https://api.anthropic.com/v1/managed-agents with header anthropic-beta: managed-agents-2026-04-01. Returns an agent ID; persist it in .env as MANAGED_AGENT_ID.",
+  "_comment": "POST this body to https://api.anthropic.com/v1/agents (NOT /v1/managed-agents). SDK: client.beta.agents.create(...). Header anthropic-beta: managed-agents-2026-04-01 is auto-added by the SDK. Returns {id, version}; persist id (and version, for pinning). To update, POST to /v1/agents/{id} — each update bumps the version, existing sessions keep their pinned version. CreateSession also requires environment_id from /v1/environments (config.type='cloud').",
   "name": "{{name}}",
   "description": "{{product}} {{type}} agent — {{system_prompt_short}}",
-  "model": "claude-sonnet-4-6",
-  "system_prompt": "{{system_prompt}}",
+  "model": "claude-opus-4-7",
+  "system": "{{system_prompt}}",
   "mcp_servers": {{mcp_servers_json}},
-  "max_tokens": 4096
+  "tools": [
+    { "type": "agent_toolset_20260401" }
+  ]
 }
