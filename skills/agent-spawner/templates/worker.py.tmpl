@@ -1,0 +1,239 @@
+"""
+Worker side of the orchestrator-worker pattern.
+
+Receives HMAC-signed dispatches from an Orchestrator (the process driving a
+managed Anthropic Agent), runs a small registry of local tools, and returns
+JSON results. Headers and signing scheme mirror bridge.py.tmpl exactly so the
+Orchestrator's signer composes with this verifier.
+
+Starting point — extend `TOOL_REGISTRY` with your own callables. Each tool
+takes a dict `input` and returns a JSON-serializable value (or raises).
+
+Run with: `uv add fastapi uvicorn pydantic` then `python worker.py`.
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+import socket
+import sys
+import time
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any, Callable
+
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# --- config (fail fast on missing required env) ---------------------------
+
+def _require_env(key: str) -> str:
+    val = os.environ.get(key)
+    if not val:
+        print(f"[worker] missing required env var: {key}", file=sys.stderr)
+        sys.exit(1)
+    return val
+
+BRIDGE_HMAC_SECRET = _require_env("BRIDGE_HMAC_SECRET").encode()
+WORKER_HOST_ID = _require_env("WORKER_HOST_ID")
+WORKER_PORT = int(os.environ.get("WORKER_PORT", "8080"))
+AUDIT_LOG_CONTENT = os.environ.get("AUDIT_LOG_CONTENT", "0") == "1"
+
+TIMESTAMP_SKEW_SECONDS = 60
+NONCE_TTL_SECONDS = 5 * 60
+NONCE_LRU_MAX = 10_000
+
+START_TIME = time.time()
+
+# --- audit log ------------------------------------------------------------
+
+AUDIT_PATH = Path.home() / ".agents" / "audit" / "{{name}}-worker.jsonl"
+AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger("{{name}}.worker")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+
+def _audit(record: dict[str, Any]) -> None:
+    try:
+        with AUDIT_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError as e:
+        logger.warning("audit write failed: %s", e)
+
+
+# --- nonce LRU (single-process; replace with shared store for HA) ----------
+
+class _NonceCache:
+    def __init__(self, max_size: int, ttl_seconds: int) -> None:
+        self._max = max_size
+        self._ttl = ttl_seconds
+        self._seen: OrderedDict[str, float] = OrderedDict()
+
+    def remember(self, nonce: str, now: float) -> bool:
+        """Return False if nonce already seen within TTL."""
+        existing = self._seen.get(nonce)
+        if existing is not None and now - existing < self._ttl:
+            return False
+        if len(self._seen) >= self._max:
+            cutoff = now - self._ttl
+            stale = [k for k, ts in self._seen.items() if ts < cutoff]
+            for k in stale:
+                self._seen.pop(k, None)
+            while len(self._seen) >= self._max:
+                self._seen.popitem(last=False)
+        self._seen[nonce] = now
+        return True
+
+_NONCES = _NonceCache(NONCE_LRU_MAX, NONCE_TTL_SECONDS)
+
+
+# --- tool registry --------------------------------------------------------
+# Each entry: name -> callable taking a dict and returning JSON-serializable.
+# Extend by adding entries: TOOL_REGISTRY["my_tool"] = my_callable
+
+def _tool_get_status(_input: dict[str, Any]) -> dict[str, Any]:
+    load1, load5, load15 = os.getloadavg()
+    return {
+        "hostname": socket.gethostname(),
+        "host_id": WORKER_HOST_ID,
+        "uptime_seconds": int(time.time() - START_TIME),
+        "load_avg": [load1, load5, load15],
+        "agent_version": "0.1.0",
+    }
+
+
+def _tool_echo(input: dict[str, Any]) -> dict[str, Any]:
+    return {"echoed": input.get("message", "")}
+
+
+TOOL_REGISTRY: dict[str, Callable[[dict[str, Any]], Any]] = {
+    "get_status": _tool_get_status,
+    "echo": _tool_echo,
+}
+
+
+# --- HMAC verification ----------------------------------------------------
+
+class _Unauthorized(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
+def _verify(raw_body: bytes, headers: dict[str, str]) -> str:
+    ts = headers.get("x-bridge-timestamp")
+    nonce = headers.get("x-bridge-nonce")
+    signature = headers.get("x-bridge-signature")
+    if not ts or not nonce or not signature:
+        raise _Unauthorized("missing_bridge_headers")
+
+    try:
+        ts_num = int(ts)
+    except ValueError:
+        raise _Unauthorized("bad_timestamp")
+
+    now = time.time()
+    if abs(now - ts_num) > TIMESTAMP_SKEW_SECONDS:
+        raise _Unauthorized("timestamp_out_of_window")
+
+    body_hash = hashlib.sha256(raw_body).hexdigest()
+    msg = f"{ts}.{nonce}.{body_hash}".encode()
+    expected = hmac.new(BRIDGE_HMAC_SECRET, msg, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise _Unauthorized("invalid_signature")
+
+    if not _NONCES.remember(nonce, now):
+        raise _Unauthorized("replay_detected")
+
+    return nonce
+
+
+# --- FastAPI app ----------------------------------------------------------
+
+app = FastAPI(title="{{product}}-{{name}}-worker", version="0.1.0")
+
+
+class ExecuteRequest(BaseModel):
+    tool: str
+    input: dict[str, Any] = {}
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {
+        "name": "{{name}}",
+        "host_id": WORKER_HOST_ID,
+        "version": "0.1.0",
+        "uptime_seconds": int(time.time() - START_TIME),
+        "tools": sorted(TOOL_REGISTRY.keys()),
+    }
+
+
+@app.post("/execute")
+async def execute(request: Request) -> JSONResponse:
+    raw_body = await request.body()
+    headers = {k.lower(): v for k, v in request.headers.items()}
+
+    try:
+        nonce = _verify(raw_body, headers)
+    except _Unauthorized as exc:
+        logger.info("execute rejected: %s", exc.reason)
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"error": exc.reason},
+        )
+
+    try:
+        parsed = ExecuteRequest.model_validate_json(raw_body)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": "invalid_request_body", "detail": str(exc)},
+        )
+
+    tool = TOOL_REGISTRY.get(parsed.tool)
+    if tool is None:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": f"unknown tool: {parsed.tool}"},
+        )
+
+    started = time.monotonic()
+    audit_record: dict[str, Any] = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "host_id": WORKER_HOST_ID,
+        "nonce": nonce,
+        "tool": parsed.tool,
+        "input_keys": sorted(parsed.input.keys()),
+    }
+    if AUDIT_LOG_CONTENT:
+        audit_record["input"] = parsed.input
+
+    try:
+        result = tool(parsed.input)
+        audit_record["status"] = "ok"
+        audit_record["latency_ms"] = int((time.monotonic() - started) * 1000)
+        _audit(audit_record)
+        return JSONResponse(status_code=200, content={"result": result})
+    except Exception as exc:
+        audit_record["status"] = "error"
+        audit_record["error"] = type(exc).__name__
+        audit_record["latency_ms"] = int((time.monotonic() - started) * 1000)
+        _audit(audit_record)
+        logger.exception("tool %s raised", parsed.tool)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "tool_failed", "type": type(exc).__name__},
+        )
+
+
+# --- entrypoint -----------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=WORKER_PORT, log_level="info")

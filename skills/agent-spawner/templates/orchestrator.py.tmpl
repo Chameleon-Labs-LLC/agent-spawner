@@ -1,0 +1,190 @@
+"""
+{{name}} orchestrator — holds the SSE stream to a managed Anthropic agent,
+dispatches `agent.custom_tool_use` events to worker hosts over HMAC-signed
+HTTPS, and feeds `user.custom_tool_result` events back. This is the correct
+client-side counterpart to a managed agent — it replaces the old direct-to-
+Anthropic bridge pattern, which couldn't actually carry HMAC headers because
+Anthropic doesn't share your bridge secret.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sys
+import time
+from typing import Any
+
+import httpx
+from anthropic import AsyncAnthropic
+
+# ---- config (fail fast at import) --------------------------------------------------
+
+def _require_env(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        sys.exit(f"Missing env var: {name}")
+    return val
+
+
+ANTHROPIC_API_KEY = _require_env("ANTHROPIC_API_KEY")
+AGENT_ID = _require_env("AGENT_ID")
+ENVIRONMENT_ID = _require_env("ENVIRONMENT_ID")
+BRIDGE_HMAC_SECRET = _require_env("BRIDGE_HMAC_SECRET").encode()
+WORKER_BASE_URL = _require_env("WORKER_BASE_URL").rstrip("/")
+
+_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+# ---- worker dispatch (HMAC over orchestrator → worker) -----------------------------
+
+def _sign(body: bytes) -> dict[str, str]:
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    body_hash = hashlib.sha256(body).hexdigest()
+    msg = f"{ts}.{nonce}.{body_hash}".encode()
+    sig = hmac.new(BRIDGE_HMAC_SECRET, msg, hashlib.sha256).hexdigest()
+    return {
+        "X-Bridge-Timestamp": ts,
+        "X-Bridge-Nonce": nonce,
+        "X-Bridge-Signature": sig,
+        "Content-Type": "application/json",
+    }
+
+
+async def dispatch_to_worker(tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+    body = json.dumps({"tool": tool_name, "input": tool_input}, sort_keys=True).encode()
+    headers = _sign(body)
+    async with httpx.AsyncClient(timeout=120) as http:
+        try:
+            r = await http.post(f"{WORKER_BASE_URL}/execute", headers=headers, content=body)
+        except httpx.HTTPError as e:
+            return {"error": True, "status": 0, "message": f"transport error: {e}"}
+    if r.status_code // 100 != 2:
+        return {"error": True, "status": r.status_code, "message": r.text}
+    try:
+        return r.json()
+    except ValueError:
+        return {"error": True, "status": r.status_code, "message": "non-JSON worker response"}
+
+
+# ---- event consumption with lossless reconnect (Pattern 1) -------------------------
+
+async def _events_with_consolidation(session_id: str):
+    """
+    Yield events with at-least-once semantics, deduped by id. On stream
+    disconnect, reconnect and overlap with events.list to recover the gap.
+    The SSE stream itself has no replay — list+dedupe is what makes this lossless.
+    """
+    seen: set[str] = set()
+    while True:
+        try:
+            history = await _client.beta.sessions.events.list(session_id=session_id)
+            for ev in history.data:
+                if ev.id and ev.id not in seen:
+                    seen.add(ev.id)
+                    yield ev
+            async with _client.beta.sessions.events.stream(session_id=session_id) as stream:
+                async for ev in stream:
+                    if ev.id and ev.id in seen:
+                        continue
+                    if ev.id:
+                        seen.add(ev.id)
+                    yield ev
+            return
+        except (httpx.HTTPError, asyncio.TimeoutError):
+            await asyncio.sleep(1.0)
+            continue
+
+
+# ---- main loop --------------------------------------------------------------------
+
+async def run(user_message: str, user_id: str | None = None) -> dict[str, Any]:
+    session_kwargs: dict[str, Any] = {
+        "agent": {"type": "agent", "id": AGENT_ID},
+        "environment_id": ENVIRONMENT_ID,
+    }
+    if user_id:
+        session_kwargs["metadata"] = {"user_id": user_id}
+    session = await _client.beta.sessions.create(**session_kwargs)
+
+    await _client.beta.sessions.events.send(
+        session_id=session.id,
+        events=[
+            {
+                "type": "user.message",
+                "content": [{"type": "text", "text": user_message}],
+            }
+        ],
+    )
+
+    pending_tools: set[str] = set()
+    tool_calls: list[dict[str, Any]] = []
+    final_text_parts: list[str] = []
+
+    async for ev in _events_with_consolidation(session.id):
+        etype = getattr(ev, "type", None)
+
+        if etype == "agent.message":
+            for block in getattr(ev, "content", []) or []:
+                if getattr(block, "type", None) == "text":
+                    text = getattr(block, "text", "") or ""
+                    if text:
+                        final_text_parts.append(text)
+
+        elif etype == "agent.custom_tool_use":
+            tool_use_id = getattr(ev, "id", None)
+            tool_name = getattr(ev, "tool_name", None) or getattr(ev, "name", None)
+            tool_input = getattr(ev, "input", {}) or {}
+            if not tool_use_id or not tool_name:
+                continue
+            pending_tools.add(tool_use_id)
+            tool_calls.append({"id": tool_use_id, "name": tool_name, "input": tool_input})
+            result = await dispatch_to_worker(tool_name, tool_input)
+            result_text = json.dumps(result, default=str)
+            await _client.beta.sessions.events.send(
+                session_id=session.id,
+                events=[
+                    {
+                        "type": "user.custom_tool_result",
+                        "custom_tool_use_id": tool_use_id,
+                        "content": [{"type": "text", "text": result_text}],
+                    }
+                ],
+            )
+            pending_tools.discard(tool_use_id)
+
+        elif etype == "session.status_idle":
+            # idle is only terminal when no custom-tool round-trips are mid-flight;
+            # otherwise the agent is *waiting* for our result and we'd break too early
+            if not pending_tools:
+                break
+
+        elif etype == "session.status_terminated":
+            break
+
+    return {
+        "session_id": session.id,
+        "final_text": "".join(final_text_parts),
+        "tool_calls": tool_calls,
+    }
+
+
+# ---- CLI -------------------------------------------------------------------------
+
+async def _main():
+    if len(sys.argv) > 1:
+        message = " ".join(sys.argv[1:])
+    else:
+        message = sys.stdin.read().strip()
+    if not message:
+        sys.exit("usage: orchestrator.py <message>   (or pipe via stdin)")
+    result = await run(message)
+    print(json.dumps(result, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())

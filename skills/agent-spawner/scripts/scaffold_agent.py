@@ -28,7 +28,7 @@ from pathlib import Path
 
 VALID_NAME = re.compile(r"^[a-z][a-z0-9_]{1,30}$")
 VALID_PRODUCT = re.compile(r"^[a-z][a-z0-9_\-]{0,30}$")  # free-form namespace
-VALID_TYPE = {"managed", "local", "hybrid"}
+VALID_TYPE = {"managed", "local", "hybrid", "orchestrator"}
 VALID_CHANNEL = {"telegram", "slack", "discord"}
 
 TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
@@ -90,10 +90,22 @@ def channel_deps(channels: list[str]) -> str:
 
 
 def required_env_keys_md(type_: str, channels: list[str]) -> str:
-    rows = ["- `ANTHROPIC_API_KEY`", "- `AGENT_PIN`"]
+    rows = ["- `ANTHROPIC_API_KEY`"]
+    if channels:
+        rows.append("- `AGENT_PIN` (already populated in `.env`)")
     if type_ == "hybrid":
-        rows.append("- `BRIDGE_HMAC_SECRET` (already populated; **must match managed-side verifier**)")
-        rows.append("- `MANAGED_AGENT_ID` (fill in after step 2)")
+        rows.append("- `BRIDGE_HMAC_SECRET` (already populated; **must match your verifier proxy** — see references/managed-vs-local.md → Hybrid gotcha)")
+        rows.append("- `DELEGATE_URL` (your verifier proxy URL, NOT api.anthropic.com)")
+        rows.append("- `AGENT_ID` (fill in after step 2b)")
+        rows.append("- `ENVIRONMENT_ID` (fill in after step 2a)")
+    if type_ == "managed":
+        rows.append("- `AGENT_ID` (fill in after step 2b)")
+        rows.append("- `ENVIRONMENT_ID` (fill in after step 2a)")
+    if type_ == "orchestrator":
+        rows.append("- `AGENT_ID` (fill in after step 2b)")
+        rows.append("- `ENVIRONMENT_ID` (fill in after step 2a)")
+        rows.append("- `BRIDGE_HMAC_SECRET` (already populated; **must match every Worker**)")
+        rows.append("- `WORKER_BASE_URL` (orchestrator dispatches `agent.custom_tool_use` events here)")
     if "telegram" in channels:
         rows += ["- `TELEGRAM_BOT_TOKEN`", "- `TELEGRAM_ALLOWED_CHAT_IDS`"]
     if "slack" in channels:
@@ -123,33 +135,77 @@ def channel_setup_md(channels: list[str]) -> str:
     return "\n\n".join(blocks) if blocks else "_No channels configured. This agent is callable from code only._"
 
 
-def managed_setup_block(type_: str) -> str:
+def managed_setup_block(type_: str, name: str, product: str) -> str:
     if type_ == "local":
         return ""
-    return (
-        "### 2a. Register the managed agent\n\n"
+    blocks = [
+        "### 2a. Create an Environment (once per workspace)\n\n"
         "```bash\n"
-        "curl -X POST https://api.anthropic.com/v1/managed-agents \\\n"
-        "  -H \"Authorization: Bearer $ANTHROPIC_API_KEY\" \\\n"
+        "curl -sS -X POST https://api.anthropic.com/v1/environments \\\n"
+        "  -H \"x-api-key: $ANTHROPIC_API_KEY\" \\\n"
+        "  -H \"anthropic-version: 2023-06-01\" \\\n"
+        "  -H \"anthropic-beta: managed-agents-2026-04-01\" \\\n"
+        "  -H \"Content-Type: application/json\" \\\n"
+        f"  -d '{{\"name\":\"{product}-{name}-env\",\"config\":{{\"type\":\"cloud\"}}}}'\n"
+        "```\n\n"
+        "Capture the `id` and set `ENVIRONMENT_ID=` in `.env`.\n\n"
+        "### 2b. Register the agent\n\n"
+        "```bash\n"
+        "curl -sS -X POST https://api.anthropic.com/v1/agents \\\n"
+        "  -H \"x-api-key: $ANTHROPIC_API_KEY\" \\\n"
+        "  -H \"anthropic-version: 2023-06-01\" \\\n"
         "  -H \"anthropic-beta: managed-agents-2026-04-01\" \\\n"
         "  -H \"Content-Type: application/json\" \\\n"
         "  -d @managed/definition.json\n"
         "```\n\n"
-        "Take the `id` from the response and set `MANAGED_AGENT_ID=` in `.env`.\n"
-    )
+        "Capture the `id` (and `version`) and set `AGENT_ID=` in `.env`. "
+        "To change the agent's behavior later, POST to `/v1/agents/{id}` — each update creates a new version, "
+        "and existing sessions keep their pinned version.\n"
+    ]
+    if type_ == "orchestrator":
+        blocks.append(
+            "\n### 2c. Deploy Workers to each host\n\n"
+            "Each remote host runs `worker/worker.py`. Workers need:\n\n"
+            "- The same `BRIDGE_HMAC_SECRET` as the orchestrator (lift from a secrets manager)\n"
+            "- A unique `WORKER_HOST_ID` (e.g. the EC2 instance ID from IMDSv2)\n"
+            "- Open inbound HTTPS on `WORKER_PORT` (default 8080) reachable from the orchestrator\n\n"
+            "Sample launch:\n\n"
+            "```bash\n"
+            "export BRIDGE_HMAC_SECRET=$(aws ssm get-parameter --name /your/bridge-secret \\\n"
+            "  --with-decryption --query Parameter.Value --output text)\n"
+            "export WORKER_HOST_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)\n"
+            "python worker/worker.py\n"
+            "```\n\n"
+            "Add custom tools by extending `TOOL_REGISTRY` in `worker/worker.py`.\n"
+        )
+    return "".join(blocks)
 
 
 def bridge_block(type_: str, delegate_to: str, delegate_url: str) -> str:
-    if type_ != "hybrid":
-        return ""
-    return (
-        f"\n### Hybrid bridge\n\n"
-        f"This local agent delegates to the managed agent **{delegate_to}** at "
-        f"`{delegate_url}`. Calls are signed with HMAC-SHA256 (timestamp + nonce + body hash) "
-        f"using `BRIDGE_HMAC_SECRET`. The managed-side verifier **must use the same secret** — "
-        f"that's the whole point. The secret was generated for you and lives in `.env`; "
-        f"copy it to the managed-side verifier's environment too.\n"
-    )
+    if type_ == "hybrid":
+        return (
+            f"\n### Hybrid bridge\n\n"
+            f"This local agent delegates to the managed agent **{delegate_to}** via your verifier "
+            f"proxy at `{delegate_url}`. Calls are signed with HMAC-SHA256 (timestamp + nonce + "
+            f"body hash) using `BRIDGE_HMAC_SECRET`. **Anthropic does not verify HMAC headers** — "
+            f"if `DELEGATE_URL` points at api.anthropic.com directly, the bridge headers are "
+            f"decorative. For real protection, run a small verifier (Lambda Function URL, API "
+            f"Gateway) that owns the secret and forwards to Anthropic with your API key. See "
+            f"`references/managed-vs-local.md` → Hybrid gotcha. If you find yourself building "
+            f"that verifier, you probably want `--type orchestrator`.\n"
+        )
+    if type_ == "orchestrator":
+        return (
+            f"\n### Orchestrator → Worker bridge\n\n"
+            f"The orchestrator (`orchestrator/orchestrator.py`) holds the SSE stream with the "
+            f"managed agent. When the agent emits an `agent.custom_tool_use` event, the "
+            f"orchestrator HMAC-signs the request and POSTs to `${{WORKER_BASE_URL}}/execute`. "
+            f"Each Worker (`worker/worker.py`) verifies the signature, runs the tool, and "
+            f"returns JSON. Both sides read `BRIDGE_HMAC_SECRET` from the environment — keep them "
+            f"in sync via a secrets manager. See `references/orchestrator-pattern.md` and "
+            f"`references/auth-and-identity.md` for the user-identity-passthrough patterns.\n"
+        )
+    return ""
 
 
 def channel_files_md(channels: list[str]) -> str:
@@ -161,6 +217,149 @@ def channel_files_md(channels: list[str]) -> str:
     if "discord" in channels:
         rows.append("│   └── discord_bot.py")
     return "\n".join(rows)
+
+
+def run_block(type_: str) -> str:
+    if type_ == "orchestrator":
+        return (
+            "**Orchestrator** (your client, holds the SSE stream with the managed agent):\n\n"
+            "```bash\n"
+            "python orchestrator/orchestrator.py \"What's the status of host i-0abc...?\"\n"
+            "```\n\n"
+            "**Worker** (deploy to each host you want to dispatch to):\n\n"
+            "```bash\n"
+            "python worker/worker.py    # listens on $WORKER_PORT (default 8080)\n"
+            "```\n\n"
+            "Extend `TOOL_REGISTRY` in `worker/worker.py` to add new dispatchable operations. "
+            "Declare matching custom-tool entries in `managed/definition.json` under `tools[]`, then "
+            "re-`POST /v1/agents/{id}` to bump the agent version.\n"
+        )
+    if type_ == "managed":
+        return (
+            "This is a definition-only scaffold — you write the client elsewhere "
+            "(Lambda, web server, CLI). See `managed/definition.json` for the agent config "
+            "and `references/orchestrator-pattern.md` for the recommended client shape.\n"
+        )
+    if type_ == "hybrid":
+        return (
+            "```bash\n"
+            "python local/agent.py\n"
+            "```\n\n"
+            "When the local agent needs to escalate, it calls `local/bridge.py` → your verifier "
+            "proxy → managed twin. In another terminal, message the bot via your channel and "
+            "start with `/unlock <PIN>` (the PIN is in your `.env`).\n"
+        )
+    return (
+        "```bash\n"
+        "python local/agent.py\n"
+        "```\n\n"
+        "In another terminal, message the bot via your channel and start with `/unlock <PIN>` "
+        "(the PIN is in your `.env`).\n"
+    )
+
+
+def files_tree(type_: str, name: str, channel_files: str) -> str:
+    if type_ == "orchestrator":
+        return (
+            "```\n"
+            f"{name}/\n"
+            "├── persona.json                    # spec card — name, prompt, tools, voice\n"
+            "├── pyproject.toml                  # uv-managed deps\n"
+            "├── .env.example                   # placeholders; committed\n"
+            "├── .env                            # real secrets; gitignored\n"
+            "├── managed/\n"
+            "│   └── definition.json             # POST body for /v1/agents\n"
+            "├── orchestrator/\n"
+            "│   ├── orchestrator.py             # SSE-stream client + custom-tool dispatcher\n"
+            "│   └── bridge.py                   # HMAC signing primitive\n"
+            "├── worker/\n"
+            "│   └── worker.py                   # FastAPI HMAC-verified tool runner (deploy per host)\n"
+            "├── ide/\n"
+            "│   ├── jetbrains-external-tool.xml\n"
+            "│   ├── jetbrains-run-config.xml\n"
+            "│   └── vscode-tasks.json\n"
+            "├── autostart/\n"
+            "│   ├── systemd-user.service        # Linux (primary)\n"
+            "│   └── windows-task.xml            # Windows (secondary)\n"
+            "└── README.md (this file)\n"
+            "```\n"
+        )
+    if type_ == "managed":
+        return (
+            "```\n"
+            f"{name}/\n"
+            "├── persona.json\n"
+            "├── pyproject.toml\n"
+            "├── .env.example                   # placeholders; committed\n"
+            "├── .env                            # real secrets; gitignored\n"
+            "├── managed/\n"
+            "│   └── definition.json             # POST body for /v1/agents\n"
+            "├── ide/\n"
+            "├── autostart/\n"
+            "└── README.md (this file)\n"
+            "```\n"
+        )
+    lines = [
+        "```",
+        f"{name}/",
+        "├── persona.json                    # spec card — name, prompt, tools, voice",
+        "├── pyproject.toml                  # uv-managed deps",
+        "├── .env.example                   # placeholders; committed",
+        "├── .env                            # real secrets; gitignored",
+    ]
+    if type_ in ("local", "hybrid"):
+        lines += [
+            "├── local/",
+            "│   ├── agent.py                    # 8-stage pipeline runtime",
+        ]
+        if type_ == "hybrid":
+            lines.append("│   └── bridge.py                   # HMAC-signed call to your verifier proxy")
+    if type_ == "hybrid":
+        lines += [
+            "├── managed/",
+            "│   └── definition.json             # POST body for /v1/agents",
+        ]
+    if channel_files:
+        lines += [
+            "├── channels/",
+            "│   ├── exfil.py                    # ring 3",
+            "│   ├── audit.py                    # ring 4",
+            channel_files,
+        ]
+    lines += [
+        "├── ide/",
+        "├── autostart/",
+        "└── README.md (this file)",
+        "```",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def managed_env_block(type_: str) -> str:
+    if type_ in ("managed", "hybrid"):
+        return (
+            "# --- Managed agent (fill in after creating an environment + agent) ---\n"
+            "# See README.md step 2a/2b for the curl commands.\n"
+            "AGENT_ID=\n"
+            "ENVIRONMENT_ID=\n"
+        )
+    if type_ == "orchestrator":
+        return (
+            "# --- Managed agent (fill in after creating an environment + agent) ---\n"
+            "# See README.md step 2a/2b for the curl commands.\n"
+            "AGENT_ID=\n"
+            "ENVIRONMENT_ID=\n"
+            "\n"
+            "# --- Orchestrator -> Worker dispatch ---\n"
+            "# Base URL of your Worker fleet. The orchestrator POSTs custom-tool calls to\n"
+            "# ${WORKER_BASE_URL}/execute, signed with BRIDGE_HMAC_SECRET.\n"
+            "WORKER_BASE_URL=\n"
+            "\n"
+            "# --- Worker-only (set per host; not used by the orchestrator) ---\n"
+            "# WORKER_HOST_ID=i-0abc...        # IMDSv2 instance ID or similar\n"
+            "# WORKER_PORT=8080\n"
+        )
+    return "# (no managed agent or bridge env vars for this type)\n"
 
 
 # ---------- main ----------
@@ -196,6 +395,11 @@ def main():
                          f"See references/managed-vs-local.md.")
     if args.type == "hybrid" and not (args.delegate_to and args.delegate_url):
         sys.exit("--delegate-to and --delegate-url are required for hybrid agents")
+    if args.type == "orchestrator" and args.channels:
+        # Orchestrators are headless services driven by code (a Lambda, a web backend);
+        # the channel-PIN model doesn't fit. Channels live on local/hybrid types.
+        print("warning: --channels is ignored for --type orchestrator", file=sys.stderr)
+        channels = []
 
     out = args.output_dir.resolve()
     if out.exists() and any(out.iterdir()) and not args.force:
@@ -237,9 +441,12 @@ def main():
         channel_deps=channel_deps(channels),
         required_env_keys_md=required_env_keys_md(args.type, channels),
         channel_setup_md=channel_setup_md(channels),
-        managed_setup_block=managed_setup_block(args.type),
+        managed_setup_block=managed_setup_block(args.type, args.name, args.product),
         bridge_block=bridge_block(args.type, args.delegate_to, args.delegate_url),
         channel_files_md=channel_files_md(channels),
+        managed_env_block=managed_env_block(args.type),
+        run_block=run_block(args.type),
+        files_tree=files_tree(args.type, args.name, channel_files_md(channels)),
     )
 
     print(f"\nScaffolding {args.name} → {out}\n")
@@ -247,12 +454,18 @@ def main():
     # ---- root ----
     write(out / "persona.json", render("persona.json.tmpl", **common))
     write(out / "pyproject.toml", render("pyproject.toml.tmpl", **common))
-    write(out / ".env.example", render("env.example.tmpl", **common))
+    env_example = render("env.example.tmpl", **common)
+    write(out / ".env.example", env_example)
+    # Also write a real .env (gitignored) with the generated secrets pre-populated,
+    # so users can run immediately without having to copy + paste the secrets.
+    env_real = env_example.replace("BRIDGE_HMAC_SECRET=", f"BRIDGE_HMAC_SECRET={hmac_secret}", 1)
+    env_real = env_real.replace("AGENT_PIN=", f"AGENT_PIN={pin}", 1)
+    write(out / ".env", env_real)
     write(out / "README.md", render("README.md.tmpl", **common))
     write(out / ".gitignore", ".env\n__pycache__/\n*.pyc\n.venv/\n")
 
     # ---- managed ----
-    if args.type in ("managed", "hybrid"):
+    if args.type in ("managed", "hybrid", "orchestrator"):
         write(out / "managed" / "definition.json", render("managed-definition.json.tmpl", **common))
 
     # ---- local ----
@@ -261,6 +474,14 @@ def main():
         write(out / "local" / "__init__.py", "")
         if args.type == "hybrid":
             write(out / "local" / "bridge.py", render("bridge.py.tmpl", **common))
+
+    # ---- orchestrator (managed-agent client + workers) ----
+    if args.type == "orchestrator":
+        write(out / "orchestrator" / "__init__.py", "")
+        write(out / "orchestrator" / "orchestrator.py", render("orchestrator.py.tmpl", **common))
+        write(out / "orchestrator" / "bridge.py", render("bridge.py.tmpl", **common))
+        write(out / "worker" / "__init__.py", "")
+        write(out / "worker" / "worker.py", render("worker.py.tmpl", **common))
 
     # ---- channels ----
     if channels:
@@ -285,13 +506,16 @@ def main():
 
     print(f"\n✓ {args.name} scaffolded.")
     print(f"  Generated PIN:  {pin}")
-    print(f"  HMAC secret:    {hmac_secret[:16]}…  (full value in .env.example)")
+    print(f"  HMAC secret:    {hmac_secret[:16]}…  (full value in .env, NOT .env.example)")
     print(f"\nNext steps:")
     print(f"  1. cd {out}")
-    print(f"  2. cp .env.example .env  &&  fill in tokens")
-    print(f"  3. read README.md")
-    if args.type in ("managed", "hybrid"):
-        print(f"  4. POST managed/definition.json to register the managed agent")
+    print(f"  2. read README.md")
+    if args.type in ("managed", "hybrid", "orchestrator"):
+        print(f"  3. Create the Environment, then POST managed/definition.json to register the agent")
+        print(f"     Fill in AGENT_ID and ENVIRONMENT_ID in .env")
+    if args.type == "orchestrator":
+        print(f"  4. Deploy worker/worker.py to each host you want to dispatch to")
+        print(f"  5. Run orchestrator/orchestrator.py wherever (Lambda, ECS, local)")
 
 
 if __name__ == "__main__":
