@@ -58,11 +58,7 @@ If you don't have `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 
 ## Run manually
 
-```bash
-python local/agent.py
-```
-
-In another terminal, message the bot via your channel and start with `/unlock <PIN>` (the PIN is in your `.env`).
+{{run_block}}
 
 ---
 
@@ -92,29 +88,7 @@ channel → queue → classifier → memory → SDK → exfil guard → cost foo
 
 ## Files
 
-```
-{{name}}/
-├── persona.json                    # the spec card — name, prompt, tools, voice
-├── pyproject.toml                  # uv-managed deps
-├── .env.example                    # template; copy to .env
-├── managed/
-│   └── definition.json             # POST body for Managed Agents API
-├── local/
-│   ├── agent.py                    # 8-stage pipeline runtime
-│   └── bridge.py                   # HMAC-signed call into managed peer (hybrid only)
-├── channels/
-│   ├── exfil.py                    # ring 3
-│   ├── audit.py                    # ring 4
-{{channel_files_md}}
-├── ide/
-│   ├── jetbrains-external-tool.xml
-│   ├── jetbrains-run-config.xml
-│   └── vscode-tasks.json
-├── autostart/
-│   ├── systemd-user.service        # Linux (primary)
-│   └── windows-task.xml            # Windows (secondary)
-└── README.md (this file)
-```
+{{files_tree}}
 
 ## Operations
 
