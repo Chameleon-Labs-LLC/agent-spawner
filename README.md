@@ -1,6 +1,6 @@
 # agent-spawner
 
-Scaffold, package, and deploy Claude agents — channel adapters (Telegram/Slack/Discord), local + managed + hybrid runtimes, HMAC-verified bridges, and one-command deploy to a Linux host over SSH.
+Scaffold, package, and deploy Claude agents — channel adapters (Telegram/Slack/Discord), four runtime shapes (`local`, `managed`, `hybrid`, `orchestrator`), HMAC-verified bridges, and one-command deploy to a Linux host over SSH.
 
 Built as a Claude Code **skill**: when this repo is open in Claude Code, the agent at `.claude/skills/agent-spawner/` is auto-loaded and Claude knows how to drive it. You can also run everything by hand — see [Quickstart](#quickstart) below.
 
@@ -10,27 +10,35 @@ Built as a Claude Code **skill**: when this repo is open in Claude Code, the age
 
 ## What you get
 
-Given one command, the spawner produces a folder like:
+Given one command, the spawner produces a folder shaped to one of four runtime types:
+
+| `--type` | What runs where | Pick when |
+|---|---|---|
+| `local` | Agent SDK process on your machine | Dev tools, single-VPS automation, private-data workflows |
+| `managed` | Agent definition only — you write the client | You already have an orchestrator and just need the agent config |
+| `orchestrator` | Managed agent + your client holding the SSE stream + remote workers | Production SaaS: managed agent reasoning, your tools on your hosts |
+| `hybrid` | Local Agent SDK + bridge to managed twin | Local automation that occasionally escalates to a managed peer |
+
+Typical `orchestrator` layout (the recommended shape for managed-agent SaaS):
 
 ```
 <agent-name>/
-├── persona.json            # name, prompt, tools, voice
-├── managed/definition.json # POST body for Anthropic's Managed Agents API
-├── local/
-│   ├── agent.py            # 8-stage message pipeline using the Agent SDK
-│   └── bridge.py           # HMAC-signed call into the managed peer (hybrid)
-├── channels/
-│   ├── telegram.py / slack.py / discord_bot.py
-│   ├── exfil.py            # outbound secret-pattern filter
-│   └── audit.py            # per-agent JSONL audit log
-├── ide/                    # JetBrains + VSCode run configs
-├── autostart/
-│   ├── systemd-user.service
-│   └── windows-task.xml
-├── .env.example            # every secret, documented
-├── README.md               # per-agent setup
-└── <agent-name>.zip        # ready to scp anywhere
+├── persona.json                 # name, prompt, tools
+├── managed/definition.json      # POST body for /v1/agents
+├── orchestrator/
+│   ├── orchestrator.py          # SSE-stream client + custom-tool dispatcher
+│   └── bridge.py                # HMAC signing primitive
+├── worker/
+│   └── worker.py                # FastAPI HMAC-verified tool runner (deploy per host)
+├── ide/                         # JetBrains + VSCode run configs
+├── autostart/                   # systemd-user.service + windows-task.xml
+├── .env.example                 # placeholders; committed
+├── .env                          # real generated secrets; gitignored
+├── README.md                    # per-agent setup
+└── <agent-name>.zip             # ready to scp anywhere
 ```
+
+`local` and `hybrid` types add `local/agent.py` (the 8-stage Agent SDK pipeline) and the `channels/` directory. See [skills/agent-spawner/references/](skills/agent-spawner/references/) for the full per-type reference docs.
 
 Each agent ships with a four-ring security model — **allowlist → PIN → exfil guard → audit log** — plus an emergency kill phrase. The scaffolder refuses to generate an agent with empty security settings.
 
@@ -173,7 +181,7 @@ Every generated channel adapter enforces, in order:
 
 Plus a **kill phrase** (env var `AGENT_KILL_PHRASE`, default `"emergency stop"`) that works from anyone, locks all sessions, drops queued messages.
 
-For hybrid agents, the local→managed call is HMAC-SHA256-signed with a shared secret generated at scaffold time.
+For hybrid and orchestrator agents, the cross-process call (local→verifier or orchestrator→worker) is HMAC-SHA256-signed with a shared secret generated at scaffold time. See `skills/agent-spawner/references/managed-vs-local.md` for the protocol details and the critical hybrid-bridge gotcha (Anthropic does NOT verify your HMAC headers).
 
 ---
 

@@ -45,19 +45,23 @@ If the user hasn't supplied them, ask for (one short batched message):
 
 - **Agent name** — snake_case (e.g. `comms`, `ops`, `intake`)
 - **Product / namespace** — free-form string used for folder grouping and the Python package name (e.g. `myapp`, `acme`, `side-project`)
-- **Type** — `managed` (cloud, customer-facing), `local` (runs on a dev machine or server), or `hybrid` (local agent that delegates to a managed peer)
+- **Type** — `managed` (definition only — you write the client), `local` (Agent SDK process on a dev machine or server), `hybrid` (local agent that delegates to a managed peer via a verifier proxy), or `orchestrator` (managed agent + your client holding the SSE stream + remote workers it dispatches custom-tool calls to). See `references/managed-vs-local.md` for the full comparison.
 - **Channels** — any of `telegram`, `slack`, `discord`, or `none` (backend-only)
 - **System prompt / role** — one or two sentences
 - **MCP servers** — optional list of HTTPS MCP URLs (managed agents require HTTP, STDIO is not supported — see `references/managed-vs-local.md`)
 
-For **hybrid**, also confirm: which managed agent does the local one delegate to? (name + base URL of the managed agent's session endpoint)
+For **hybrid**, also confirm: which managed agent does the local one delegate to? (name + base URL of *your verifier proxy*, NOT api.anthropic.com — see `references/managed-vs-local.md` → Hybrid gotcha. If they're about to invent a verifier, suggest `--type orchestrator` instead.)
+
+For **orchestrator**, no extra args at scaffold time. The user fills in `AGENT_ID`, `ENVIRONMENT_ID`, and `WORKER_BASE_URL` in `.env` after creating those resources via the Managed Agents API (README step 2a/2b).
 
 ### 2. Read the relevant references
 
 Before generating files, read whichever apply:
 
 - `references/architecture.md` — the layered agent stack. Read once per session.
-- `references/managed-vs-local.md` — when to pick each, the HMAC bridge protocol, the `managed-agents-2026-04-01` beta header, MCP constraints. Read for any `managed` or `hybrid` agent.
+- `references/managed-vs-local.md` — type comparison (managed / local / hybrid / orchestrator), the HMAC bridge protocol, the `managed-agents-2026-04-01` beta header, MCP constraints, the hybrid-bridge gotcha. Read for any `managed`, `hybrid`, or `orchestrator` agent.
+- `references/orchestrator-pattern.md` — orchestrator client shape, SSE event flow, setup steps. Read for any `orchestrator` agent.
+- `references/auth-and-identity.md` — passing web-user identity into a managed-agent session safely (metadata + per-user Vaults + custom tools, no creds in prompts). Read whenever the agent will act on behalf of authenticated users.
 - `references/channels.md` — the four-ring security model (allowlist → PIN → exfil guard → audit), per-channel quirks. Read for any agent with channels.
 - `references/ide-integration.md` — JetBrains External Tools format, VSCode tasks schema. Read when generating IDE configs.
 - `references/deploy.md` — how the SCP/SSH deploy scripts work, SSH key discovery, what to verify on the remote host.
@@ -68,7 +72,7 @@ Before generating files, read whichever apply:
 python scripts/scaffold_agent.py \
   --name <name> \
   --product <namespace> \
-  --type <managed|local|hybrid> \
+  --type <managed|local|hybrid|orchestrator> \
   --channels <comma-separated or 'none'> \
   --system-prompt "<one or two sentences>" \
   --mcp-servers "<comma-separated URLs or empty>" \
@@ -79,7 +83,7 @@ python scripts/scaffold_agent.py \
 
 Default `--output-dir`: `~/code/<product>/agents/<name>` on Linux. On Windows the scaffolder accepts forward slashes and normalizes. If the user is in a Claude Code session with a clear repo root, infer from the working directory.
 
-The scaffolder fills templates from `templates/`, generates an HMAC secret for the bridge, writes `.env.example` with every required key, and creates the README.
+The scaffolder fills templates from `templates/`, generates an HMAC secret + PIN, writes `.env.example` (committed, placeholders only) AND `.env` (gitignored, with real generated secrets), and creates the README.
 
 ### 4. Verify and explain
 
@@ -87,7 +91,7 @@ After scaffolding, show the user a tree of what was created and call out:
 
 1. **Secrets to fill in** in `.env` — list them by name (e.g. `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`, `BRIDGE_HMAC_SECRET`).
 2. **The verification handshake** — for hybrid agents, point out that the HMAC secret must match on both ends.
-3. **How to launch** — in IDE (import the XML configs) or via `python local/agent.py` / systemd-user.
+3. **How to launch** — `local`/`hybrid`: `python local/agent.py`. `orchestrator`: `python orchestrator/orchestrator.py "<request>"` (and `python worker/worker.py` on each remote host). `managed`: no launch script — the user writes their own client.
 
 ### 5. Package the zip
 
