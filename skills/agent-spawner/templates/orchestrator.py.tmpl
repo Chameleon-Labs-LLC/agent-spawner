@@ -87,13 +87,16 @@ async def _events_with_consolidation(session_id: str):
                 if ev.id and ev.id not in seen:
                     seen.add(ev.id)
                     yield ev
-            async with _client.beta.sessions.events.stream(session_id=session_id) as stream:
-                async for ev in stream:
-                    if ev.id and ev.id in seen:
-                        continue
-                    if ev.id:
-                        seen.add(ev.id)
-                    yield ev
+            # NOTE: events.stream() returns a coroutine that resolves to an
+            # AsyncStream — you await it, then iterate. It is NOT an async
+            # context manager, so `async with ...` raises AttributeError.
+            stream = await _client.beta.sessions.events.stream(session_id=session_id)
+            async for ev in stream:
+                if ev.id and ev.id in seen:
+                    continue
+                if ev.id:
+                    seen.add(ev.id)
+                yield ev
             return
         except (httpx.HTTPError, asyncio.TimeoutError):
             await asyncio.sleep(1.0)
@@ -158,9 +161,15 @@ async def run(user_message: str, user_id: str | None = None) -> dict[str, Any]:
             pending_tools.discard(tool_use_id)
 
         elif etype == "session.status_idle":
-            # idle is only terminal when no custom-tool round-trips are mid-flight;
-            # otherwise the agent is *waiting* for our result and we'd break too early
-            if not pending_tools:
+            # Per managed-agents-client-patterns Pattern 5: idle is only terminal
+            # when stop_reason.type is `end_turn` or `retries_exhausted`. Other
+            # values (notably `requires_action`) mean the agent is *waiting on us*
+            # (tool confirmation, tool result) — keep streaming or we'll miss the
+            # resumption. Breaking solely on "no pending tools" races on the
+            # post-tool-result idle that arrives before the agent's next message.
+            stop_reason = getattr(ev, "stop_reason", None)
+            reason_type = getattr(stop_reason, "type", None) if stop_reason else None
+            if reason_type in ("end_turn", "retries_exhausted"):
                 break
 
         elif etype == "session.status_terminated":
