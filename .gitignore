@@ -6,3 +6,6 @@ __pycache__/
 .idea/
 .vscode/
 .DS_Store
+
+# Generated Discord posts / announcements
+discord-post-*.md
