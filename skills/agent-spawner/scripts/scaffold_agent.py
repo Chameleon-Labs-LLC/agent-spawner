@@ -488,6 +488,8 @@ def main():
         write(out / "channels" / "__init__.py", "")
         write(out / "channels" / "exfil.py", render("exfil.py.tmpl", **common))
         write(out / "channels" / "audit.py", render("audit.py.tmpl", **common))
+        if args.type in ("local", "hybrid"):
+            write(out / "channels" / "telemetry.py", render("telemetry.py.tmpl", **common))
         if "telegram" in channels:
             write(out / "channels" / "telegram.py", render("channel-telegram.py.tmpl", **common))
         if "slack" in channels:

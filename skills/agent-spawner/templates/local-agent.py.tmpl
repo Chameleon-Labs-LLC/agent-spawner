@@ -55,6 +55,9 @@ async def handle_message(text: str, channel: str, user_id: str) -> str:
     started = time.time()
     task_id = f"{int(started*1000)}"
 
+    from channels.telemetry import record
+    record(task_id, "session_start", {}, agent_name=AGENT_NAME, cwd=str(Path.cwd()))
+
     # Stage 4: memory inject (loads any product-relevant CLAUDE.md)
     system = PERSONA["system_prompt"]
     claude_md = Path(__file__).parent.parent / "CLAUDE.md"
@@ -75,12 +78,16 @@ async def handle_message(text: str, channel: str, user_id: str) -> str:
 
     # Stage 6: exfil guard
     from channels.exfil import scrub
+    from channels.telemetry import record
     reply = scrub(reply)
+    record(task_id, "message", {"role": "assistant", "excerpt": reply[:500]})
 
     # Stage 7: cost footer (rough — replace with actual usage from SDK when wired)
     # Stage 8: reply (handled by channel adapter)
 
     _hive_record(task_id, text[:200], 0.0, 0, 0, started)
+    from channels.telemetry import record
+    record(task_id, "session_end", {"reason": "done"})
     return reply
 
 
