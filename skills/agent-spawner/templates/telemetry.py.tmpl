@@ -9,7 +9,15 @@ import time
 from pathlib import Path
 
 AGENT_NAME = "{{name}}"
-_SPOOL = Path(os.environ.get("CL_COLLECTOR_SPOOL", str(Path.home() / ".cl-collector" / "spool")))
+# CL_COLLECTOR_SPOOL_DIR is canonical (matches the Plan B collector's own
+# config.py env var); CL_COLLECTOR_SPOOL is the older forwarder-only name,
+# kept as a fallback so an existing override isn't silently split from the
+# collector's spool dir.
+_SPOOL = Path(
+    os.environ.get("CL_COLLECTOR_SPOOL_DIR")
+    or os.environ.get("CL_COLLECTOR_SPOOL")
+    or str(Path.home() / ".cl-collector" / "spool")
+)
 _started: set[str] = set()
 
 
