@@ -23,8 +23,23 @@ from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+# Exfil guard is a security control: import it unguarded so a missing module
+# fails at startup, never by silently skipping redaction.
+from channels.exfil import scrub
+
+# Telemetry is fail-open: a bundle without channels/telemetry.py (e.g. one
+# scaffolded before it existed) must still handle messages.
+try:
+    from channels.telemetry import record
+except Exception:
+    def record(*_args, **_kwargs):
+        return None
+
 AGENT_NAME = "{{name}}"
 AGENT_TYPE = "{{type}}"
+# Ship reply excerpts to FleetView only when explicitly enabled — replies can
+# quote user input, and the collector sends the spool off-host.
+TELEMETRY_LOG_CONTENT = os.getenv("TELEMETRY_LOG_CONTENT", "0") == "1"
 HIVE_DB = Path(os.getenv("HIVE_DB", str(Path.home() / ".chameleon" / "hive.db")))
 HIVE_DB.parent.mkdir(parents=True, exist_ok=True)
 
@@ -55,38 +70,41 @@ async def handle_message(text: str, channel: str, user_id: str) -> str:
     started = time.time()
     task_id = f"{int(started*1000)}"
 
-    from channels.telemetry import record
     record(task_id, "session_start", {}, agent_name=AGENT_NAME, cwd=str(Path.cwd()))
+    try:
+        # Stage 4: memory inject (loads any product-relevant CLAUDE.md)
+        system = PERSONA["system_prompt"]
+        claude_md = Path(__file__).parent.parent / "CLAUDE.md"
+        if claude_md.exists():
+            system = system + "\n\n" + claude_md.read_text()
 
-    # Stage 4: memory inject (loads any product-relevant CLAUDE.md)
-    system = PERSONA["system_prompt"]
-    claude_md = Path(__file__).parent.parent / "CLAUDE.md"
-    if claude_md.exists():
-        system = system + "\n\n" + claude_md.read_text()
+        # Stage 5: SDK
+        options = ClaudeAgentOptions(system_prompt=system, max_turns=10)
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(text)
+            chunks = []
+            async for msg in client.receive_response():
+                if hasattr(msg, "content"):
+                    for block in msg.content:
+                        if hasattr(block, "text"):
+                            chunks.append(block.text)
+            reply = "".join(chunks)
 
-    # Stage 5: SDK
-    options = ClaudeAgentOptions(system_prompt=system, max_turns=10)
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(text)
-        chunks = []
-        async for msg in client.receive_response():
-            if hasattr(msg, "content"):
-                for block in msg.content:
-                    if hasattr(block, "text"):
-                        chunks.append(block.text)
-        reply = "".join(chunks)
+        # Stage 6: exfil guard (scrub BEFORE anything is recorded)
+        reply = scrub(reply)
+        msg_payload = {"role": "assistant", "len": len(reply)}
+        if TELEMETRY_LOG_CONTENT:
+            msg_payload["excerpt"] = reply[:500]
+        record(task_id, "message", msg_payload)
 
-    # Stage 6: exfil guard
-    from channels.exfil import scrub
-    from channels.telemetry import record
-    reply = scrub(reply)
-    record(task_id, "message", {"role": "assistant", "excerpt": reply[:500]})
+        # Stage 7: cost footer (rough — replace with actual usage from SDK when wired)
+        # Stage 8: reply (handled by channel adapter)
 
-    # Stage 7: cost footer (rough — replace with actual usage from SDK when wired)
-    # Stage 8: reply (handled by channel adapter)
-
-    _hive_record(task_id, text[:200], 0.0, 0, 0, started)
-    from channels.telemetry import record
+        _hive_record(task_id, text[:200], 0.0, 0, 0, started)
+    except Exception:
+        # Always close the session, or FleetView shows it live forever.
+        record(task_id, "session_end", {"reason": "error"})
+        raise
     record(task_id, "session_end", {"reason": "done"})
     return reply
 

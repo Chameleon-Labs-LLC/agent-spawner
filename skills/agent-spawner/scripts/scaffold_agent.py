@@ -499,12 +499,16 @@ def main():
         write(out / "worker" / "worker.py", render("worker.py.tmpl", **common))
 
     # ---- channels ----
-    if channels:
+    # local/hybrid agents import channels.exfil and channels.telemetry from
+    # handle_message even when no channel adapters are configured, so the
+    # package must exist for those types regardless of --channels.
+    if channels or args.type in ("local", "hybrid"):
         write(out / "channels" / "__init__.py", "")
         write(out / "channels" / "exfil.py", render("exfil.py.tmpl", **common))
+    if args.type in ("local", "hybrid"):
+        write(out / "channels" / "telemetry.py", render("telemetry.py.tmpl", **common))
+    if channels:
         write(out / "channels" / "audit.py", render("audit.py.tmpl", **common))
-        if args.type in ("local", "hybrid"):
-            write(out / "channels" / "telemetry.py", render("telemetry.py.tmpl", **common))
         if "telegram" in channels:
             write(out / "channels" / "telegram.py", render("channel-telegram.py.tmpl", **common))
         if "slack" in channels:

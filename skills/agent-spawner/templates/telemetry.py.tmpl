@@ -18,7 +18,6 @@ _SPOOL = Path(
     or os.environ.get("CL_COLLECTOR_SPOOL")
     or str(Path.home() / ".cl-collector" / "spool")
 )
-_started: set[str] = set()
 
 
 def record(session_key: str, etype: str, payload: dict, *, agent_name: str = AGENT_NAME, cwd: str | None = None) -> None:
@@ -29,8 +28,9 @@ def record(session_key: str, etype: str, payload: dict, *, agent_name: str = AGE
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
             "payload": payload,
         }
-        if session_key not in _started:
-            _started.add(session_key)
+        # Session info rides on the explicit start event only — no local state,
+        # so a failed first write can't strand a session without its info block.
+        if etype == "session_start":
             info = {"source": "sdk-spawned", "agentName": agent_name}
             if cwd:
                 info["cwd"] = cwd
