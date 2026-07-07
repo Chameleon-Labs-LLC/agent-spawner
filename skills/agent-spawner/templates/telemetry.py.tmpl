@@ -1,0 +1,42 @@
+"""FleetView telemetry for {{name}}: append wire-shaped NDJSON to the local
+collector spool. The cl-collector daemon ships it (signing, seqs, retry).
+Stdlib-only, fail-open — telemetry must never break the agent."""
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+AGENT_NAME = "{{name}}"
+# CL_COLLECTOR_SPOOL_DIR is canonical (matches the Plan B collector's own
+# config.py env var); CL_COLLECTOR_SPOOL is the older forwarder-only name,
+# kept as a fallback so an existing override isn't silently split from the
+# collector's spool dir.
+_SPOOL = Path(
+    os.environ.get("CL_COLLECTOR_SPOOL_DIR")
+    or os.environ.get("CL_COLLECTOR_SPOOL")
+    or str(Path.home() / ".cl-collector" / "spool")
+)
+_started: set[str] = set()
+
+
+def record(session_key: str, etype: str, payload: dict, *, agent_name: str = AGENT_NAME, cwd: str | None = None) -> None:
+    try:
+        event = {
+            "sessionKey": session_key,
+            "type": etype,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+            "payload": payload,
+        }
+        if session_key not in _started:
+            _started.add(session_key)
+            info = {"source": "sdk-spawned", "agentName": agent_name}
+            if cwd:
+                info["cwd"] = cwd
+            event["session"] = info
+        _SPOOL.mkdir(parents=True, exist_ok=True)
+        with (_SPOOL / f"agent-{AGENT_NAME}.ndjson").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": "wire", "event": event}, separators=(",", ":"), default=str) + "\n")
+    except Exception:
+        pass  # telemetry must never break the agent

@@ -1,6 +1,6 @@
 {
   "name": "agent-spawner",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Scaffold, package, and deploy Claude agents — channel adapters (Telegram/Slack/Discord), HMAC-signed bridges between local + managed, IDE configs, systemd/Task Scheduler units, and SCP/SSH deploy to a Linux host.",
   "author": {
     "name": "Chameleon Labs LLC",
