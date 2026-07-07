@@ -104,6 +104,10 @@ deploy-dry agent_dir host="":
 
 # --- housekeeping ---
 
+# Run the scaffolder test suite (stdlib-only, no deps).
+test:
+    python3 -m unittest discover tests -v
+
 # End-to-end smoke test: scaffold a throwaway agent, package it, clean up.
 smoke:
     #!/usr/bin/env bash

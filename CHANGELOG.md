@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Post-merge review fixes for PR #2 (FleetView telemetry spool-append).
+
+### Fixed
+- **Channel-less local/hybrid bundles no longer crash on the first message.**
+  The scaffolder now always writes `channels/__init__.py`, `channels/exfil.py`,
+  and `channels/telemetry.py` for `--type local`/`hybrid`, even with
+  `--channels none`; previously `local/agent.py` imported `channels.telemetry`
+  and `channels.exfil` unconditionally but the package was only scaffolded when
+  channel adapters were configured (`ModuleNotFoundError` in `handle_message`).
+  The telemetry import in the agent template is also guarded with a no-op
+  fallback so pre-existing bundles keep working.
+- **`session_end` now fires on error paths.** `handle_message` records
+  `session_end` with `{"reason": "error"}` when any pipeline stage raises, so
+  failed sessions no longer sit "live" in FleetView forever.
+- Telemetry's session-info block is now keyed on `etype == "session_start"`
+  instead of a process-lifetime `_started` set — removes unbounded growth and
+  the stranded-session-info case when the first spool write failed.
+
+### Changed
+- **Assistant-reply excerpts are no longer shipped to FleetView by default.**
+  The `message` telemetry event now records the reply length; the scrubbed
+  500-char excerpt is included only when `TELEMETRY_LOG_CONTENT=1` (documented
+  in `.env.example`, matching the `AUDIT_LOG_CONTENT` precedent).
+
+### Added
+- `tests/test_scaffold_smoke.py` — scaffolds local (with/without channels) and
+  hybrid bundles into a tmpdir, byte-compiles every rendered `.py`, and asserts
+  every `channels.*` import in the rendered agent resolves. Run via `just test`.
+
 ## [0.1.1] — 2026-05-24
 
 The "Managed Agents API correctness" cycle (PR #1): corrected the Managed
