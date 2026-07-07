@@ -77,19 +77,21 @@ just doctor                     # reports which tools are missing
 
 # 3. Scaffold an agent
 just scaffold comms myapp local telegram "You are the comms agent."
-# → creates ~/code/myapp/agents/comms/
+# → creates ~/code/comms/ as a new git repo with an initial commit
+# (pass a 6th arg like `no-repo` to skip `git init` — e.g. when dropping it
+#  inside an existing project)
 
 # 4. Fill in its .env (Telegram bot token, allowed chat IDs, PIN…)
-$EDITOR ~/code/myapp/agents/comms/.env
+$EDITOR ~/code/comms/.env
 
 # 5. Run it locally
-cd ~/code/myapp/agents/comms
+cd ~/code/comms
 uv sync
 uv run python local/agent.py
 
 # 6. Or deploy it to the host in $SSH_HOST
 cd -
-just deploy-full ~/code/myapp/agents/comms
+just deploy-full ~/code/comms
 ```
 
 ---
@@ -140,8 +142,11 @@ just bootstrap-ubuntu  # one-shot install on apt-based distros
 just init            # create .env from template
 just env-check       # print the env vars the justfile sees
 
-just scaffold NAME PRODUCT TYPE CHANNELS "PROMPT" [OUTPUT_DIR]
+just scaffold NAME PRODUCT TYPE CHANNELS "PROMPT" [OUTPUT_DIR] [NO_REPO]
+  #   default OUTPUT_DIR = ~/code/<NAME> (initialized as a new git repo)
+  #   pass any non-empty value for NO_REPO to skip `git init` + initial commit
   #   example: just scaffold comms myapp local telegram "You are the comms agent."
+  #   example: just scaffold comms myapp local telegram "..." "" no-repo
 
 just package AGENT_DIR      # build the shippable .zip
 just smoke                  # end-to-end sanity test (no remote needed)

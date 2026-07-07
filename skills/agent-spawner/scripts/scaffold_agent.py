@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import secrets
+import subprocess
 import sys
 from pathlib import Path
 
@@ -374,8 +376,18 @@ def main():
     ap.add_argument("--mcp-servers", default="", help="comma-separated HTTPS URLs (managed agents require HTTP, not STDIO)")
     ap.add_argument("--delegate-to", default="", help="hybrid only: name of managed peer")
     ap.add_argument("--delegate-url", default="", help="hybrid only: base URL of managed peer's session API")
-    ap.add_argument("--output-dir", required=True, type=Path)
+    ap.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="where to scaffold the agent. Defaults to ~/code/<name> (a new sibling repo).",
+    )
     ap.add_argument("--force", action="store_true", help="overwrite if output dir exists")
+    ap.add_argument(
+        "--no-repo",
+        action="store_true",
+        help="skip 'git init' + initial commit in the output folder (default: create a new repo).",
+    )
     args = ap.parse_args()
 
     # ---- validate ----
@@ -401,7 +413,10 @@ def main():
         print("warning: --channels is ignored for --type orchestrator", file=sys.stderr)
         channels = []
 
-    out = args.output_dir.resolve()
+    output_dir = args.output_dir
+    if output_dir is None:
+        output_dir = Path(os.path.expanduser("~/code")) / args.name
+    out = output_dir.expanduser().resolve()
     if out.exists() and any(out.iterdir()) and not args.force:
         sys.exit(f"{out} already exists and is non-empty. Use --force to overwrite.")
     out.mkdir(parents=True, exist_ok=True)
@@ -506,6 +521,10 @@ def main():
     write(out / "autostart" / "windows-task.xml", render("windows-task.xml.tmpl", **common))
     write(out / "autostart" / "systemd-user.service", render("systemd-user.service.tmpl", **common))
 
+    # ---- git init (default on) ----
+    if not args.no_repo:
+        init_git_repo(out, args.name)
+
     print(f"\n✓ {args.name} scaffolded.")
     print(f"  Generated PIN:  {pin}")
     print(f"  HMAC secret:    {hmac_secret[:16]}…  (full value in .env, NOT .env.example)")
@@ -518,6 +537,51 @@ def main():
     if args.type == "orchestrator":
         print(f"  4. Deploy worker/worker.py to each host you want to dispatch to")
         print(f"  5. Run orchestrator/orchestrator.py wherever (Lambda, ECS, local)")
+
+
+def init_git_repo(out: Path, name: str) -> None:
+    """Initialize a git repo in `out` and create an initial commit.
+
+    Skips cleanly if `git` is unavailable or the folder is already inside a repo.
+    """
+    if not _which("git"):
+        print("  (skipping git init: 'git' not found on PATH)")
+        return
+    try:
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=out,
+            capture_output=True,
+            text=True,
+        )
+        if inside.returncode == 0 and inside.stdout.strip() == "true":
+            print("  (skipping git init: output folder is already inside a git repo)")
+            return
+
+        subprocess.run(["git", "init", "-b", "main"], cwd=out, check=True, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=out, check=True, capture_output=True)
+        # Initial commit — tolerate missing user.name/email by setting env for this commit only.
+        env = os.environ.copy()
+        env.setdefault("GIT_AUTHOR_NAME", "agent-spawner")
+        env.setdefault("GIT_AUTHOR_EMAIL", "agent-spawner@local")
+        env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+        env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+        subprocess.run(
+            ["git", "commit", "-m", f"Initial scaffold: {name}"],
+            cwd=out,
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+        print(f"  + initialized git repo at {out} (branch: main)")
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode(errors="replace").strip()
+        print(f"  (git init failed: {stderr or e}; continuing without a repo)")
+
+
+def _which(cmd: str) -> bool:
+    from shutil import which
+    return which(cmd) is not None
 
 
 if __name__ == "__main__":

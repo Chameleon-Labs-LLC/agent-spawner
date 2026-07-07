@@ -37,20 +37,27 @@ env-check:
 
 # --- scaffold / package ---
 
-# Scaffold a new agent. Example:
+# Scaffold a new agent. Creates a new git repo at ~/code/<name> by default.
+# Example:
 #   just scaffold comms myapp local telegram "You are the comms agent."
-scaffold name product type channels prompt output_dir="":
+#   just scaffold comms myapp local telegram "..." "" no-repo      # skip git init
+scaffold name product type channels prompt output_dir="" no_repo="":
     #!/usr/bin/env bash
     set -euo pipefail
     out="{{output_dir}}"
-    [[ -z "$out" ]] && out="$HOME/code/{{product}}/agents/{{name}}"
-    python3 "{{SCRIPTS}}/scaffold_agent.py" \
+    [[ -z "$out" ]] && out="$HOME/code/{{name}}"
+    args=( \
         --name "{{name}}" \
         --product "{{product}}" \
         --type "{{type}}" \
         --channels "{{channels}}" \
         --system-prompt "{{prompt}}" \
-        --output-dir "$out"
+        --output-dir "$out" \
+    )
+    if [[ -n "{{no_repo}}" ]]; then
+        args+=( --no-repo )
+    fi
+    python3 "{{SCRIPTS}}/scaffold_agent.py" "${args[@]}"
     echo ""
     echo "Agent scaffolded at: $out"
 

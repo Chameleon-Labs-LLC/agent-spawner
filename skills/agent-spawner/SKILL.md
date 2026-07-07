@@ -78,10 +78,13 @@ python scripts/scaffold_agent.py \
   --mcp-servers "<comma-separated URLs or empty>" \
   --delegate-to <managed-agent-name> \   # hybrid only
   --delegate-url <https://...> \         # hybrid only
-  --output-dir <absolute path>
+  [--output-dir <absolute path>] \       # default: ~/code/<name>
+  [--no-repo]                            # default: init a new git repo + initial commit
 ```
 
-Default `--output-dir`: `~/code/<product>/agents/<name>` on Linux. On Windows the scaffolder accepts forward slashes and normalizes. If the user is in a Claude Code session with a clear repo root, infer from the working directory.
+**Default layout**: each agent lands in its own new git repo at `~/code/<name>`. The scaffolder runs `git init -b main`, stages every generated file, and makes an initial commit tagged `Initial scaffold: <name>`. Pass `--no-repo` to skip the git step (useful when you're dropping the agent inside an existing repo). The `--product` argument still controls the Python package name and metadata — it no longer affects the folder path.
+
+On Windows the scaffolder accepts forward slashes and normalizes. If the user is in a Claude Code session with a clear repo root and wants the agent inside it, pass an explicit `--output-dir` and usually `--no-repo`.
 
 The scaffolder fills templates from `templates/`, generates an HMAC secret + PIN, writes `.env.example` (committed, placeholders only) AND `.env` (gitignored, with real generated secrets), and creates the README.
 
@@ -121,7 +124,8 @@ This skill does **not** provision VPSs, create cloud accounts, or manage DNS. It
 
 When the user doesn't specify, assume:
 
-- **OS** — Linux (systemd-user autostart, `~/code/<product>/agents/<name>` layout). Generate Windows Task Scheduler XML too, because cross-platform costs nothing.
+- **OS** — Linux (systemd-user autostart, `~/code/<name>` layout as a fresh git repo). Generate Windows Task Scheduler XML too, because cross-platform costs nothing.
+- **Git** — initialize the output folder as a repo with an initial commit. Users opt out with `--no-repo` (e.g. when the agent is nested inside an existing project).
 - **Python** — 3.11+ with `uv` for dependency management (`pyproject.toml`, not `requirements.txt`).
 - **MCP transport** — HTTP/SSE, never STDIO (required for managed agents; keeping local consistent makes hybrid easier).
 - **Telegram** as the default channel when the user says "channels yes" but doesn't pick one — lowest setup friction.
