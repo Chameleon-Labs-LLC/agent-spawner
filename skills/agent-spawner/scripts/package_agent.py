@@ -2,7 +2,8 @@
 """
 package_agent.py — zip a scaffolded agent for shipping.
 
-Excludes: .env, .venv, __pycache__, .git, *.pyc
+Excludes: every .env* file except .env.example/.env.sample/.env.template,
+.venv, __pycache__, .git, *.pyc
 
 Usage:
   package_agent.py <path-to-agent-folder> [--output <path-to-zip>]
@@ -16,10 +17,17 @@ from pathlib import Path
 
 EXCLUDE_NAMES = {".env", ".venv", "__pycache__", ".git", ".idea", ".vscode", ".DS_Store"}
 EXCLUDE_SUFFIXES = {".pyc"}
+# Dotenv templates hold placeholders only, so they ship. Every other `.env*`
+# file (.env.local, .env.production, ...) may hold real secrets and never does.
+DOTENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
+
+
+def is_secret_dotenv(name: str) -> bool:
+    return name.startswith(".env") and name not in DOTENV_TEMPLATES
 
 
 def should_skip(p: Path) -> bool:
-    if p.name in EXCLUDE_NAMES:
+    if p.name in EXCLUDE_NAMES or is_secret_dotenv(p.name):
         return True
     if p.suffix in EXCLUDE_SUFFIXES:
         return True
