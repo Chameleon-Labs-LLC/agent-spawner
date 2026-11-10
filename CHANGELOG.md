@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Post-merge review fixes for PR #2 (FleetView telemetry spool-append).
+Post-merge review fixes for PR #2 (FleetView telemetry spool-append), plus
+one packaging fix.
+
+### Security
+- **`package_agent.py` no longer zips `.env` variants.** Only the exact name
+  `.env` was excluded, so `.env.local`, `.env.production` and similar files went
+  into the shipping bundle. Every `.env*` file or directory, in any letter
+  case, is now excluded except the placeholder templates `.env.example`,
+  `.env.sample` and `.env.template`. Excluded directories are pruned, so
+  nothing inside them is packaged, and symlinks and Windows junctions are
+  never packaged or followed (one with an allowed name could point at a
+  secret). Covered by
+  `tests/test_package_agent.py`.
 
 ### Fixed
 - **Channel-less local/hybrid bundles no longer crash on the first message.**

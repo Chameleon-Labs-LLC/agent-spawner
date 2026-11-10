@@ -102,7 +102,7 @@ After scaffolding, show the user a tree of what was created and call out:
 python scripts/package_agent.py <output-dir>
 ```
 
-Bundles everything except `.env`, `.venv`, and cache directories. Produces `<agent-name>.zip` in the agent folder.
+Bundles everything except dotenv files (`.env`, `.env.local`, `.env.production` and every other `.env*`; only the placeholder templates `.env.example`, `.env.sample` and `.env.template` ship), `.venv`, and cache directories. Produces `<agent-name>.zip` in the agent folder.
 
 ### 6. (Optional) Deploy to a remote Linux host
 
