@@ -73,6 +73,19 @@ class PackageAgentTest(unittest.TestCase):
             self.assertNotIn("notes.txt", names)
             self.assertIn("agent.py", names)
 
+    @unittest.skipUnless(sys.platform == "win32", "junctions are Windows-only")
+    def test_windows_junctions_are_never_followed(self) -> None:
+        import _winapi
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = Path(tmp) / "demo"
+            write(agent, "agent.py")
+            write(agent, ".env.secrets/API_KEY")
+            # `assets` is an allowed name, but it is a junction to the
+            # excluded directory; its contents must not ship as assets/API_KEY.
+            _winapi.CreateJunction(str(agent / ".env.secrets"), str(agent / "assets"))
+            names = package(agent, Path(tmp) / "demo.zip")
+            self.assertEqual(names, {"agent.py"})
+
 
 if __name__ == "__main__":
     unittest.main()
