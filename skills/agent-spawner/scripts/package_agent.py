@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import stat
 import sys
 import zipfile
 from pathlib import Path
@@ -102,6 +103,10 @@ def main():
                     continue
                 rel = fp.relative_to(agent_dir)
                 if should_skip(rel):
+                    skipped += 1
+                    continue
+                # Regular files only: a FIFO would hang the read, a socket raises.
+                if not stat.S_ISREG(os.lstat(fp).st_mode):
                     skipped += 1
                     continue
                 z.write(fp, Path(agent_name) / rel)

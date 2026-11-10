@@ -73,6 +73,15 @@ class PackageAgentTest(unittest.TestCase):
             self.assertNotIn("notes.txt", names)
             self.assertIn("agent.py", names)
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs need a POSIX system")
+    def test_non_regular_files_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = Path(tmp) / "demo"
+            write(agent, "agent.py")
+            os.mkfifo(agent / "runtime.fifo")  # reading it would block forever
+            names = package(agent, Path(tmp) / "demo.zip")
+            self.assertEqual(names, {"agent.py"})
+
     @unittest.skipUnless(sys.platform == "win32", "junctions are Windows-only")
     def test_windows_junctions_are_never_followed(self) -> None:
         import _winapi
